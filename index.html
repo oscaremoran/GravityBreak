@@ -37,8 +37,8 @@
   <button data-tool="rift">7 Rift</button>
   <button data-tool="erase">8 Erase</button>
   <span class="sep"></span>
-  <button data-real="0">Solar</button>
-  <button data-real="1">Lunar</button>
+  <button data-real="0">Red</button>
+  <button data-real="1">Blue</button>
   <button data-real="2">Both</button>
   <span class="sep"></span>
   <button id="bUndo">Undo</button>
@@ -78,12 +78,12 @@ const snap = v => Math.round(v * DPR) / DPR;
 
 // Two realities, each with its own palette. Objects tagged 0 or 1 only exist
 // in that reality; tag 2 exists in both.
-const S = 0, L = 1, B = 2;
+const S = 0, L = 1, B = 2;   // S = red reality, L = blue reality, B = both
 const THEMES = [
-  { name: 'SOLAR', bg1: '#2a0f1f', bg2: '#5a1e2e', ground: '#ff7a3d', solid: '#ffb347', ghost: 'rgba(80,200,255,', player: '#ffe066' },
-  { name: 'LUNAR', bg1: '#071a2e', bg2: '#123a5a', ground: '#3dc8ff', solid: '#7fe3ff', ghost: 'rgba(255,170,70,', player: '#c8f7ff' },
+  { name: 'RED', bg1: '#2a0f16', bg2: '#5a1e26', ground: '#ff4d4d', solid: '#ff5a5a', ghost: 'rgba(80,200,255,', player: '#ffd6d6' },
+  { name: 'BLUE', bg1: '#071a2e', bg2: '#123a5a', ground: '#3dc8ff', solid: '#7fe3ff', ghost: 'rgba(255,90,90,', player: '#c8f7ff' },
 ];
-const REAL_COLORS = ['#ffb347', '#7fe3ff', '#e8e8f0'];
+const REAL_COLORS = ['#ff5a5a', '#7fe3ff', '#e8e8f0'];   // red, blue, both
 
 const SIZE = 40;           // one tile, in pixels
 const SPEED = 540;         // constant scroll speed, px/s
@@ -96,8 +96,10 @@ const WARP_TIME = 0.18;    // the warp animation starts during the freeze and fi
 const WARP_RADIUS = 110;   // how far the warp ring spreads from the cube
 const STEP = 1 / 240;      // fixed physics step; rendering interpolates between steps
 const PLAYER_X = 160;
-const CEIL_ROWS = 9;       // playfield height in tiles; flipped gravity runs along the ceiling
-const CEIL = () => GROUND - CEIL_ROWS * SIZE;
+const CEIL_ROWS = 9;       // rows you can build in; there's no ceiling above them
+const CEIL = () => GROUND - CEIL_ROWS * SIZE;       // top of the buildable area
+const TOP = () => CEIL() + SIZE;                    // underside of the top row: where flipped players run
+const OUT_OF_BOUNDS = () => CEIL() - 4 * SIZE;      // flipped with nothing overhead: lost to the sky
 const PRESS_BUFFER = 0.12;
 const RIFT_R = 26;         // drawn radius of a rift
 const RIFT_HIT = 40;       // how close the cube must be to use a rift
@@ -119,7 +121,7 @@ const TOOLS = ['spike', 'hspike', 'block', 'slab', 'wall', 'gate', 'rift', 'eras
 const SPREAD = 1.5;
 function build(script, spread = SPREAD) {
   const objs = [];
-  let x = 0;
+  let x = 0, roofStart = 0;
   const api = {
     gap(t) { x += t >= 3 ? Math.round(t * spread) : t; },
     spike(n = 1, r = B, y = 0) {
@@ -132,9 +134,13 @@ function build(script, spread = SPREAD) {
     },
     // Spikes hanging from the ceiling, for flipped-gravity sections.
     hspike(n = 1, r = B) {
-      for (let i = 0; i < n; i++) objs.push({ t: 'hspike', x: x + i, y: CEIL_ROWS - 1, r });
+      for (let i = 0; i < n; i++) objs.push({ t: 'hspike', x: x + i, y: CEIL_ROWS - 2, r });
       x += n;
     },
+    // There's no ceiling, so flipped sections need a roof: a row of blocks along the
+    // top from roofOn() to roofOff(), for the player to run under upside down.
+    roofOn() { roofStart = x; },
+    roofOff() { for (let i = roofStart; i < x; i++) objs.push({ t: 'block', x: i, y: CEIL_ROWS - 1, r: B }); },
     wall(r) { objs.push({ t: 'wall', x, y: 0, r }); x += 1; },
     gate(r = B) { objs.push({ t: 'gate', x, y: 0, r }); x += 1; },
     // A rift dx tiles ahead of the cursor at row y, without advancing.
@@ -177,57 +183,58 @@ const DEFAULT_LEVELS = [
     l.spike(1); l.gap(7);
     l.spike(2); l.gap(7);
     l.spike(3); l.gap(9);
-    l.wall(S); l.gap(4);                                  // Lunar
+    l.wall(S); l.gap(4);                                  // Blue
     l.spike(1, L); l.gap(7);
     l.spike(1, S); l.gap(1); l.spike(1, L); l.gap(7);
-    l.wall(L); l.gap(5); l.wall(S); l.gap(8);             // Lunar
+    l.wall(L); l.gap(5); l.wall(S); l.gap(8);             // Blue
     l.block(3, 1); l.gap(7);
     l.spike(2); l.gap(7);
     l.pit(6, L); l.gap(6);
-    l.wall(L); l.gap(4);                                  // Solar
+    l.wall(L); l.gap(4);                                  // Red
     l.spike(2, S); l.gap(8);
-    l.spike(1); l.wallHere(S); l.spike(2); l.gap(8);      // Lunar (shift mid-jump)
+    l.spike(1); l.wallHere(S); l.spike(2); l.gap(8);      // Blue (shift mid-jump)
     l.spike(2, L); l.gap(7);
-    l.wall(L); l.gap(5); l.wall(S); l.gap(5); l.wall(L); l.gap(8);  // Solar
+    l.wall(L); l.gap(5); l.wall(S); l.gap(5); l.wall(L); l.gap(8);  // Red
     l.pit(8, S); l.gap(8);
     l.spike(3); l.gap(8);
     l.block(4, 1); l.block(4, 2); l.gap(8);
     l.spike(2);
   }),
-  // Horizon: gravity gates. Comments also track gravity (up = on the ceiling).
+  // Horizon: gravity gates. There's no ceiling, so every flip up is covered by a roof
+  // that ends just after the gate that flips you back down. Comments also track gravity.
   build(l => {
     // The opening is deliberately roomy so the first flips can be learned.
     l.gap(12);
     l.spike(1); l.gap(7);
     l.spike(2); l.gap(14);
-    l.gate(); l.gap(16);                                  // up
+    l.roofOn(); l.gate(); l.gap(16);                      // up
     l.hspike(1); l.gap(12);
     l.hspike(2); l.gap(16);
-    l.gate(); l.gap(16);                                  // down
+    l.gate(); l.roofOff(); l.gap(16);                     // down
     l.spike(2); l.gap(10);
-    l.gate(L); l.gap(10);                                 // Lunar-only gate: ignored while Solar
+    l.gate(L); l.gap(10);                                 // Blue-only gate with no roof: stay Red!
     l.spike(1); l.gap(7);
-    l.wall(S); l.gap(5);                                  // Lunar
-    l.gate(L); l.gap(2); l.spike(12); l.gap(1);           // up, over a floor-spike carpet
-    l.gate(); l.gap(8);                                   // down
+    l.wall(S); l.gap(5);                                  // Blue
+    l.roofOn(); l.gate(L); l.gap(2); l.spike(12); l.gap(1);  // up, over a floor-spike carpet
+    l.gate(); l.roofOff(); l.gap(8);                      // down
     l.spike(2, L); l.gap(7);
-    l.wall(L); l.gap(6);                                  // Solar
-    l.gate(S); l.gap(8);                                  // up
+    l.wall(L); l.gap(6);                                  // Red
+    l.roofOn(); l.gate(S); l.gap(8);                      // up
     l.hspike(3); l.gap(7);
     l.hspike(1, S); l.gap(1); l.hspike(1, L); l.gap(7);
-    l.wall(S); l.gap(6);                                  // Lunar, still up
+    l.wall(S); l.gap(6);                                  // Blue, still up
     l.hspike(2, L); l.gap(8);
-    l.gate(L); l.gap(8);                                  // down
-    l.spike(1); l.wallHere(L); l.spike(2); l.gap(8);      // Solar (shift mid-jump)
-    l.gate(S); l.gap(2); l.spike(10); l.gap(1); l.gate(S); l.gap(8);  // up over a carpet, down again
-    // Shift after the Lunar gate, not before it, or it flips you into the ceiling spikes.
-    l.gate(L); l.gap(1); l.hspike(10); l.gap(-6); l.wall(S); l.gap(10);  // Lunar
+    l.gate(L); l.roofOff(); l.gap(8);                     // down
+    l.spike(1); l.wallHere(L); l.spike(2); l.gap(8);      // Red (shift mid-jump)
+    l.roofOn(); l.gate(S); l.gap(2); l.spike(10); l.gap(1); l.gate(S); l.roofOff(); l.gap(8);  // up over a carpet, down again
+    // Shift after the Blue gate, not before it, or it flips you into the spikes under the roof.
+    l.roofOn(); l.gate(L); l.gap(1); l.hspike(10); l.gap(-6); l.wall(S); l.gap(10); l.roofOff();  // Blue
     l.spike(2); l.gap(7);
-    l.gate(); l.gap(8);                                   // up
+    l.roofOn(); l.gate(); l.gap(8);                       // up
     l.hspike(2); l.gap(6);
-    l.wall(L); l.gap(6);                                  // Solar, up
+    l.wall(L); l.gap(6);                                  // Red, up
     l.hspike(2, S); l.gap(7);
-    l.gate(); l.gap(8);                                   // down
+    l.gate(); l.roofOff(); l.gap(8);                      // down
     l.spike(3);
   }),
   // Break: the final level. Every section is a rift trick; rifts float you about
@@ -236,25 +243,25 @@ const DEFAULT_LEVELS = [
     l.gap(12);
     l.rift(3, 3); l.spike(13); l.gap(5);
     l.rift(3, 3); l.rift(13, 3); l.spike(24); l.gap(5);   // rift chain
-    l.rift(3, 3, L); l.spike(13); l.gap(4);               // shift to make the rift solid: Lunar
-    l.wall(L); l.gap(3);                                  // Solar
-    l.rift(3, 3, L); l.rift(13, 3, S); l.spike(24); l.gap(5);  // shift before each rift: Solar
-    l.spike(1); l.wallHere(S); l.spike(2); l.gap(4);      // Lunar
-    l.rift(3, 3, S); l.rift(13, 3, L); l.rift(23, 3, S); l.spike(34); l.gap(5);  // three rifts, three shifts: Solar
-    l.rift(3, 3); l.spike(7); l.wallHere(S); l.spike(6); l.gap(5);   // a wall inside a rift pit: Lunar
+    l.rift(3, 3, L); l.spike(13); l.gap(4);               // shift to make the rift solid: Blue
+    l.wall(L); l.gap(3);                                  // Red
+    l.rift(3, 3, L); l.rift(13, 3, S); l.spike(24); l.gap(5);  // shift before each rift: Red
+    l.spike(1); l.wallHere(S); l.spike(2); l.gap(4);      // Blue
+    l.rift(3, 3, S); l.rift(13, 3, L); l.rift(23, 3, S); l.spike(34); l.gap(5);  // three rifts, three shifts: Red
+    l.rift(3, 3); l.spike(7); l.wallHere(S); l.spike(6); l.gap(5);   // a wall inside a rift pit: Blue
     l.rift(2, 2); l.spike(3); l.block(10, 4); l.spike(6); l.gap(5);  // a pillar too tall to jump
-    l.gate(); l.gap(7);                                   // up
-    l.rift(3, 5, S); l.rift(13, 5); l.hspike(24); l.gap(5);  // upside-down chain: Solar
-    l.gate(); l.gap(7);                                   // down
-    l.rift(3, 3, L); l.rift(13, 3, S); l.rift(23, 3, L); l.spike(34); l.gap(4);  // Lunar
-    l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(13); l.gap(5);   // Solar, then shift back mid-air: Lunar
+    l.roofOn(); l.gate(); l.gap(7);                       // up
+    l.rift(3, 4, S); l.rift(13, 4); l.hspike(24); l.gap(5);  // upside-down chain: Red
+    l.gate(); l.roofOff(); l.gap(7);                      // down
+    l.rift(3, 3, L); l.rift(13, 3, S); l.rift(23, 3, L); l.spike(34); l.gap(4);  // Blue
+    l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(13); l.gap(5);   // Red, then shift back mid-air: Blue
     l.spike(3);
   }, 1.2),
 ];
 
 // --- Save data -----------------------------------------------------------------
 const SAVE_KEY = 'gravityBreakSave';
-const DEFAULTS_VERSION = 8;   // bumping this wipes best scores on next load
+const DEFAULTS_VERSION = 9;   // bumping this wipes best scores on next load
 let store = { version: DEFAULTS_VERSION, best: [0, 0, 0], levels: [null, null, null] };
 let storageOk = true;
 try {
@@ -367,7 +374,7 @@ function restart() {
   flash = 0;
   cpFlash = 0;   // the banner is only for reaching a checkpoint, not respawning at one
   const g = cp ? cp.g : 1;
-  player = { y: g === 1 ? GROUND - SIZE : CEIL(), vy: 0, rot: 0, grounded: true, g };
+  player = { y: g === 1 ? GROUND - SIZE : TOP(), vy: 0, rot: 0, grounded: true, g };
   pressBuffer = 0;
   boss = null;
   shots = [];
@@ -506,12 +513,15 @@ const NEEDLE_LO = 70, NEEDLE_HI = 200; // the gap in a needle wall, in px from t
 const AFTER = { split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.8, carpet2: 2.6 };
 const JUMPED = ['low', 'lowR', 'wave', 'needle', 'carpet', 'carpet2', 'slam', 'split'];
 // y for something `off` pixels from the floor the player will be standing on.
-const floorY = (g, off) => (g === 1 ? GROUND - off : CEIL() + off);
+const floorY = (g, off) => (g === 1 ? GROUND - off : TOP() + off);
+// Gravity attacks bring their own roof (there's no ceiling): a gate flips you up under
+// a roof that covers the next few attacks, and a second gate at its far end flips you back.
+const ROOF_COVER = { gate: 2, slam: 1, flipflop: 0 };   // attacks fired while you're under the roof
 let boss = null, shots = [];
 
 function startBoss() {
   setCheckpoint(level.length * SIZE);
-  boss = { name: level.name.toUpperCase(), hp: BOSS_HP, max: BOSS_HP, t: 0, enter: 0, timer: 1.4, queue: [], hit: 0, dying: 0, g: player.g, banner: 0 };
+  boss = { name: level.name.toUpperCase(), hp: BOSS_HP, max: BOSS_HP, t: 0, enter: 0, timer: 1.4, queue: [], hit: 0, dying: 0, banner: 0 };
 }
 
 const bossX = () => W - 150 + (1 - boss.enter) * (1 - boss.enter) * 320;
@@ -528,24 +538,47 @@ function waitFor(prev, k, gap) {
   return wait;
 }
 
+function landOnRoofs(prevTop) {
+  if (player.g !== -1) return;
+  for (const sh of shots) {
+    if (sh.k !== 'roof' || PLAYER_X + SIZE - 4 < sh.x || PLAYER_X + 4 > sh.x + sh.w) continue;
+    if (player.y < TOP() && prevTop >= TOP() - 10) { player.y = TOP(); player.vy = 0; player.grounded = true; }
+  }
+}
+
 function nextWave() {
   const phase = bossPhase();
   const gap = BOSS_GAP[levelIdx] * (1 - 0.08 * phase);
   const kinds = BOSS_PHASES[levelIdx][phase];
-  let prev = 'orb';
-  for (let n = 0; n < WAVE_LEN[levelIdx][phase]; n++) {
-    const k = kinds[Math.floor(Math.random() * kinds.length)];
+  let prev = 'orb', cover = 0;
+  const count = WAVE_LEN[levelIdx][phase];
+  for (let n = 0; n <= count; n++) {
+    let k = n === count ? 'orb' : kinds[Math.floor(Math.random() * kinds.length)];
+    if (cover > 0 && k in ROOF_COVER) k = 'low';           // no new roof while under one
     const r = k === 'lowR' || k === 'beam' || (k === 'carpet' && (phase === 2 || levelIdx === 2)) ? randReality() : B;
-    boss.queue.push({ k, wait: waitFor(prev, k, gap), r });
+    let wait = waitFor(prev, k, gap);
+    if (cover === 0 && boss.queue.length && boss.queue[boss.queue.length - 1].endsRoof) wait = Math.max(wait, 1.4);   // time to fall back down
+    const a = { k, wait, r: k === 'orb' ? B : r, g: cover > 0 ? -1 : 1 };   // cores exist in both realities
+    if (cover > 0 && --cover === 0) a.endsRoof = true;
+    if (k in ROOF_COVER) { cover = Math.min(ROOF_COVER[k], count - n); a.cover = cover; if (cover === 0) a.endsRoof = true; }
+    boss.queue.push(a);
     prev = k;
   }
-  boss.queue.push({ k: 'orb', wait: waitFor(prev, 'orb', gap), r: B });   // cores exist in both realities
 }
 
 function fire(a) {
   const x = bossX() - 40;
-  const g = boss.g;
+  const g = a.g || 1;
   const add = sh => shots.push({ px: sh.x, ...sh });
+  // Roof attacks: gate up, a roof long enough to cover the next a.cover attacks, gate down.
+  const roof = minTime => {
+    let t = minTime;
+    for (let n = 0, sum = 0; n < a.cover; n++) { sum += boss.queue[n].wait; t = Math.max(t, sum); }
+    const w = SHOT_SPEED * (t + 0.7);
+    add({ k: 'gate', x, r: B });
+    add({ k: 'roof', x, w, r: B });
+    add({ k: 'gate', x: x + w - 30, r: B });
+  };
   if (a.k === 'low' || a.k === 'lowR') add({ k: 'ball', x, y: floorY(g, SHOT_R + 2), r: a.r });
   else if (a.k === 'high') add({ k: 'ball', x, y: floorY(g, 95), r: B });
   else if (a.k === 'beam') add({ k: 'beam', x, r: a.r });
@@ -559,17 +592,11 @@ function fire(a) {
     add({ k: 'beam', x: x + SHOT_SPEED * 0.42, r: 1 - r });
   } else if (a.k === 'pulse') add({ k: 'pulse', x, r: B });
   else if (a.k === 'wave') add({ k: 'ball', x, y: floorY(g, 85), r: B, wave: g, wt: Math.random() * 6 });
-  else if (a.k === 'gate') {
-    add({ k: 'gate', x, r: B });
-    boss.g = -g;   // everything after this is aimed at the player's new floor
-  } else if (a.k === 'slam') {
-    add({ k: 'gate', x, r: B });
-    add({ k: 'ball', x: x + SHOT_SPEED * 0.75, y: floorY(-g, SHOT_R + 2), r: B });
-    boss.g = -g;
-  } else if (a.k === 'flipflop') {
-    add({ k: 'gate', x, r: B });
-    add({ k: 'gate', x: x + SHOT_SPEED * 0.9, r: B });
-  } else if (a.k === 'needle') add({ k: 'needle', x, g, r: B });
+  else if (a.k === 'gate') roof(0.6);
+  else if (a.k === 'slam') {
+    roof(0.75);
+    add({ k: 'ball', x: x + SHOT_SPEED * 0.75, y: floorY(-1, SHOT_R + 2), r: B });   // lands as you do
+  } else if (a.k === 'flipflop') roof(0.6); else if (a.k === 'needle') add({ k: 'needle', x, g, r: B });
   else if (a.k === 'carpet') {
     add({ k: 'carpet', x, w: CARPET_W, g, r: B });
     add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: a.r });
@@ -586,16 +613,16 @@ function shotHits(sh) {
   if (sh.k === 'beam') return overlapX(12);
   if (sh.k === 'split') {
     if (!overlapX(12)) return false;
-    const lo = sh.g === 1 ? GROUND - (py + ps) : py - CEIL();   // player's distance from the floor
+    const lo = sh.g === 1 ? GROUND - (py + ps) : py - TOP();    // player's distance from the floor
     return reality === sh.low ? lo < SPLIT_H : lo + ps > SPLIT_H;
   }
   if (sh.k === 'needle') {
     if (!overlapX(12)) return false;
-    const lo = sh.g === 1 ? GROUND - (py + ps) : py - CEIL();   // player's distance from the floor
+    const lo = sh.g === 1 ? GROUND - (py + ps) : py - TOP();    // player's distance from the floor
     return lo < NEEDLE_LO || lo + ps > NEEDLE_HI;
   }
   if (sh.k === 'carpet') {
-    const top = sh.g === 1 ? GROUND - 26 : CEIL();
+    const top = sh.g === 1 ? GROUND - 26 : TOP();
     return px < sh.x + sh.w && px + ps > sh.x && py < top + 26 && py + ps > top;
   }
   const r = sh.k === 'orb' ? 22 : SHOT_R - 2;
@@ -618,7 +645,7 @@ function damageBoss() {
   // Clear the field and start the next phase fresh.
   shots = [];
   boss.queue = [];
-  boss.g = player.g;
+  if (player.g === -1) flipGravity();   // the roof is gone too, so bring the player back down
   if (boss.hp <= 0) { boss.dying = 1.2; return; }
   boss.timer = 1.6;
   boss.banner = 1.4;
@@ -650,7 +677,7 @@ function updateBoss(dt) {
   }
   shots = shots.filter(sh => sh.x + (sh.w || 0) > -60 && !sh.gone);
   for (const sh of shots) {
-    if (!exists(sh)) continue;
+    if (!exists(sh) || sh.k === 'roof') continue;
     if (sh.k === 'gate' || sh.k === 'pulse') {
       if (!sh.used && sh.x <= PLAYER_X + SIZE / 2) {
         sh.used = true;
@@ -808,7 +835,8 @@ function update(dt) {
   cam += SPEED * dt;
   shiftTimer = Math.max(0, shiftTimer - dt);
   placeObstacles(cam);
-  if (level.cp !== null && !boss && startCam < level.cp * SIZE && cam >= level.cp * SIZE) setCheckpoint(level.cp * SIZE);
+  // Only save while gravity is normal: flipped at a roofless checkpoint means you're about to fall into the sky.
+  if (level.cp !== null && !boss && player.g === 1 && startCam < level.cp * SIZE && cam >= level.cp * SIZE) setCheckpoint(level.cp * SIZE);
 
   // Player physics. g is 1 for normal gravity and -1 when flipped onto the ceiling;
   // landing on blocks of the current reality counts as ground on either side.
@@ -818,7 +846,8 @@ function update(dt) {
   player.y += player.vy * dt;
   player.grounded = false;
   if (player.y + SIZE >= GROUND) { player.y = GROUND - SIZE; player.vy = 0; if (g === 1) player.grounded = true; }
-  if (player.y <= CEIL()) { player.y = CEIL(); player.vy = 0; if (g === -1) player.grounded = true; }
+  if (player.y < OUT_OF_BOUNDS()) { die(); return; }
+  if (boss) landOnRoofs(prevTop);
   pressBuffer = Math.max(0, pressBuffer - dt);
 
   for (const o of obstacles) {
@@ -1014,13 +1043,6 @@ function drawBackground(th, scroll) {
   ctx.fillRect(0, GROUND, W, 4);
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
   ctx.fillRect(0, GROUND + 4, W, H - GROUND);
-  // Ceiling: where flipped gravity takes you.
-  ctx.fillStyle = 'rgba(0,0,0,0.2)';
-  ctx.fillRect(0, 0, W, CEIL());
-  ctx.globalAlpha = 0.5;
-  ctx.fillStyle = th.ground;
-  ctx.fillRect(0, CEIL() - 2, W, 2);
-  ctx.globalAlpha = 1;
 }
 
 function drawButton(x, y, w, h, label, color, onClick) {
@@ -1181,7 +1203,8 @@ function drawEditor() {
   const lines = [
     'Left click: place  ·  Right click: erase  ·  Scroll / A D / ← →: move (hold Shift = fast)',
     'Q: cycle reality  ·  Ctrl/Cmd+Z: undo  ·  P: test from start  ·  T: test from here  ·  B: test boss  ·  Esc: menu',
-    'Solar = orange, Lunar = blue, Both = white. Slabs: half-height platforms. Spike ▼ hangs from the ceiling.',
+    'Red, Blue, Both = white. Slabs: half-height platforms. Spike ▼ hangs under blocks. There is no ceiling —',
+    'flipped gravity needs blocks overhead (put a row of blocks along the top row) or you fall into the sky.',
     'Gravity gates flip gravity when passed in their reality. Rifts give a mid-air jump when you press jump on them.',
   ];
   lines.forEach((s, i) => ctx.fillText(s, 16, GROUND + 44 + i * 20));
@@ -1213,7 +1236,7 @@ function drawBall(x, y, r, color, live, spin) {
 
 // The Warden. Each level's Warden has its own body; all share the eye, which tracks
 // the player and turns red on the last hit. A defeated Warden has an X for an eye.
-//   style 0 (Shift):   a square split into Solar and Lunar halves
+//   style 0 (Shift):   a square split into Red and Blue halves
 //   style 1 (Horizon): a diamond that keeps flipping over its horizon line
 //   style 2 (Break):   a cracked block with orbiting shards; cracks grow with damage
 function drawWarden(x, y, scale, t, color, ex, ey, angry, defeated, style, cracks) {
@@ -1290,13 +1313,19 @@ function drawBoss(alpha) {
     const x = sh.px + (sh.x - sh.px) * alpha;
     const live = exists(sh);
     const color = live ? shotColor(sh) : th.ghost + '1)';
-    if (sh.k === 'gate') drawGate(x - 10, 20, live, color);
+    if (sh.k === 'roof') {
+      ctx.fillStyle = REAL_COLORS[B];
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 2;
+      ctx.fillRect(x, CEIL(), sh.w, SIZE);
+      ctx.strokeRect(x, CEIL(), sh.w, SIZE);
+    } else if (sh.k === 'gate') drawGate(x - 10, 20, live, color);
     else if (sh.k === 'rift') drawRift(x, sh.y, live, live ? (sh.r === B ? '#fff' : color) : color, sh.used);
     else if (sh.k === 'carpet') {
       const path = new Path2D();
       for (let cx = x; cx < x + sh.w; cx += SIZE) {
         if (sh.g === 1) addShape(path, 'spike', cx, GROUND - SIZE, SIZE, SIZE);
-        else addShape(path, 'hspike', cx, CEIL(), SIZE, SIZE);
+        else addShape(path, 'hspike', cx, TOP(), SIZE, SIZE);
       }
       ctx.fillStyle = REAL_COLORS[B];
       ctx.strokeStyle = 'rgba(255,255,255,0.6)';
@@ -1304,7 +1333,7 @@ function drawBoss(alpha) {
       ctx.fill(path);
       ctx.stroke(path);
     } else if (sh.k === 'pulse') {
-      // Reality pulse: half Solar, half Lunar.
+      // Reality pulse: half Red, half Blue.
       const top = CEIL(), h = GROUND - top;
       ctx.save();
       ctx.globalAlpha = 0.6;
@@ -1319,7 +1348,7 @@ function drawBoss(alpha) {
       ctx.restore();
     } else if (sh.k === 'split') {
       // Each part is solid only in its own reality; the other part is drawn as a ghost.
-      const floor = sh.g === 1 ? GROUND : CEIL(), far = sh.g === 1 ? CEIL() : GROUND, mid = floorY(sh.g, SPLIT_H);
+      const floor = sh.g === 1 ? GROUND : TOP(), far = sh.g === 1 ? CEIL() : GROUND, mid = floorY(sh.g, SPLIT_H);
       ctx.save();
       ctx.lineWidth = 2;
       for (const [y0, y1, r] of [[floor, mid, sh.low], [mid, far, 1 - sh.low]]) {
@@ -1341,7 +1370,7 @@ function drawBoss(alpha) {
     } else if (sh.k === 'needle') {
       // A wall with a gap you have to jump through.
       const a = floorY(sh.g, NEEDLE_LO), b = floorY(sh.g, NEEDLE_HI);
-      const floor = sh.g === 1 ? GROUND : CEIL(), far = sh.g === 1 ? CEIL() : GROUND;
+      const floor = sh.g === 1 ? GROUND : TOP(), far = sh.g === 1 ? CEIL() : GROUND;
       ctx.save();
       ctx.fillStyle = REAL_COLORS[B];
       ctx.strokeStyle = 'rgba(255,255,255,0.6)';
