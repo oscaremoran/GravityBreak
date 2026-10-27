@@ -100,7 +100,11 @@ const CEIL_ROWS = 9;       // playfield height in tiles; flipped gravity runs al
 const CEIL = () => GROUND - CEIL_ROWS * SIZE;
 const PRESS_BUFFER = 0.12;
 const RIFT_R = 26;         // drawn radius of a rift
-const RIFT_HIT = 40;       // how close the cube must be to use a rift // a jump press stays live this long, so rifts are easy to hit
+const RIFT_HIT = 40;       // how close the cube must be to use a rift
+// A rift launch is a floaty jump: a bit softer than a normal jump, under lighter
+// gravity until you land, so it hangs ~40% longer and carries you further.
+const RIFT_LAUNCH = 0.82;  // launch speed relative to a normal jump
+const RIFT_FLOAT = 0.59;   // gravity multiplier while floating from a rift // a jump press stays live this long, so rifts are easy to hit
 const SOLID = new Set(['spike', 'hspike', 'block', 'wall']);
 const COLUMN = ['wall', 'gate'];   // objects that fill a whole column
 const TOOLS = ['spike', 'hspike', 'block', 'slab', 'wall', 'gate', 'rift', 'erase'];
@@ -226,30 +230,31 @@ const DEFAULT_LEVELS = [
     l.gate(); l.gap(8);                                   // down
     l.spike(3);
   }),
-  // Break: the final level. Tight gaps (no extra spread) and every section is a rift trick.
+  // Break: the final level. Every section is a rift trick; rifts float you about
+  // 12 tiles, so chained rifts sit 10 tiles apart.
   build(l => {
     l.gap(12);
-    l.rift(3, 3); l.spike(10); l.gap(5);
-    l.rift(3, 3); l.rift(11, 3); l.spike(18); l.gap(5);   // rift chain
-    l.rift(3, 3, L); l.spike(10); l.gap(4);               // shift to make the rift solid: Lunar
+    l.rift(3, 3); l.spike(13); l.gap(5);
+    l.rift(3, 3); l.rift(13, 3); l.spike(24); l.gap(5);   // rift chain
+    l.rift(3, 3, L); l.spike(13); l.gap(4);               // shift to make the rift solid: Lunar
     l.wall(L); l.gap(3);                                  // Solar
-    l.rift(3, 3, L); l.rift(11, 3, S); l.spike(18); l.gap(5);  // shift before each rift: Solar
+    l.rift(3, 3, L); l.rift(13, 3, S); l.spike(24); l.gap(5);  // shift before each rift: Solar
     l.spike(1); l.wallHere(S); l.spike(2); l.gap(4);      // Lunar
-    l.rift(3, 3, S); l.rift(11, 3, L); l.rift(19, 3, S); l.spike(26); l.gap(5);  // three rifts, three shifts: Solar
-    l.rift(3, 3); l.spike(6); l.wallHere(S); l.spike(5); l.gap(5);   // a wall inside a rift pit: Lunar
-    l.rift(2, 2); l.spike(3); l.block(6, 4); l.spike(6); l.gap(5);   // a pillar too tall to jump
+    l.rift(3, 3, S); l.rift(13, 3, L); l.rift(23, 3, S); l.spike(34); l.gap(5);  // three rifts, three shifts: Solar
+    l.rift(3, 3); l.spike(7); l.wallHere(S); l.spike(6); l.gap(5);   // a wall inside a rift pit: Lunar
+    l.rift(2, 2); l.spike(3); l.block(10, 4); l.spike(6); l.gap(5);  // a pillar too tall to jump
     l.gate(); l.gap(7);                                   // up
-    l.rift(3, 5, S); l.rift(11, 5); l.hspike(18); l.gap(5);  // upside-down chain: Solar
+    l.rift(3, 5, S); l.rift(13, 5); l.hspike(24); l.gap(5);  // upside-down chain: Solar
     l.gate(); l.gap(7);                                   // down
-    l.rift(3, 3, L); l.rift(11, 3, S); l.rift(19, 3, L); l.spike(26); l.gap(4);  // Lunar
-    l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(10); l.gap(5);   // Solar, then shift back mid-air: Lunar
+    l.rift(3, 3, L); l.rift(13, 3, S); l.rift(23, 3, L); l.spike(34); l.gap(4);  // Lunar
+    l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(13); l.gap(5);   // Solar, then shift back mid-air: Lunar
     l.spike(3);
   }, 1.2),
 ];
 
 // --- Save data -----------------------------------------------------------------
 const SAVE_KEY = 'gravityBreakSave';
-const DEFAULTS_VERSION = 7;   // bumping this wipes best scores on next load
+const DEFAULTS_VERSION = 8;   // bumping this wipes best scores on next load
 let store = { version: DEFAULTS_VERSION, best: [0, 0, 0], levels: [null, null, null] };
 let storageOk = true;
 try {
@@ -412,6 +417,7 @@ function pressJump() {
 function flipGravity() {
   player.g = -player.g;
   player.grounded = false;
+  player.float = false;
   burst(PLAYER_X + SIZE / 2, player.y + SIZE / 2, '#fff', 12);
 }
 
@@ -422,7 +428,8 @@ function riftHits(cx, cy) {
 }
 
 function useRift(cx, cy) {
-  player.vy = JUMP_V * player.g;
+  player.vy = JUMP_V * RIFT_LAUNCH * player.g;
+  player.float = true;
   player.grounded = false;
   pressBuffer = 0;
   burst(cx, cy, '#fff', 14);
@@ -477,7 +484,9 @@ function burst(x, y, color, n) {
 // Every hit starts a new phase with new attacks. Three hits break it.
 const BOSS_HP = 3;
 const BOSS_GAP = [0.75, 0.72, 0.6];   // base seconds between attacks, per level
-const WAVE_LEN = [3, 4, 5];           // attacks per wave, per phase
+// Attacks per wave (one core drops after each wave), per level and phase: Horizon's
+// Warden drops cores less often than Shift's, and Break's only rarely.
+const WAVE_LEN = [[3, 4, 5], [5, 6, 7], [8, 9, 10]];
 const BOSS_PHASES = [
   // Shift: reality beams, then split walls and twin beams, then reality pulses that shift you.
   [['beam', 'lowR', 'high', 'lowR'], ['beam', 'split', 'twin', 'lowR', 'high'], ['split', 'twin', 'pulse', 'lowR', 'beam']],
@@ -489,12 +498,12 @@ const BOSS_PHASES = [
 const PHASE_NAMES = ['', 'PHASE II', 'FINAL PHASE'];
 const SHOT_SPEED = 620;
 const SHOT_R = 15;
-const CARPET_W = 420, CARPET2_W = 800;
+const CARPET_W = 560, CARPET2_W = 1050;
 const WAVE_SPEED = 2.6;               // how fast wave shots bob up and down (rad/s)
 const SPLIT_H = 90;                   // where a split wall changes reality, in px from the floor
 const NEEDLE_LO = 70, NEEDLE_HI = 200; // the gap in a needle wall, in px from the floor
 // Minimum seconds after each attack before the next one, so every pattern is fair.
-const AFTER = { split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.5, carpet2: 2.1 };
+const AFTER = { split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.8, carpet2: 2.6 };
 const JUMPED = ['low', 'lowR', 'wave', 'needle', 'carpet', 'carpet2', 'slam', 'split'];
 // y for something `off` pixels from the floor the player will be standing on.
 const floorY = (g, off) => (g === 1 ? GROUND - off : CEIL() + off);
@@ -524,7 +533,7 @@ function nextWave() {
   const gap = BOSS_GAP[levelIdx] * (1 - 0.08 * phase);
   const kinds = BOSS_PHASES[levelIdx][phase];
   let prev = 'orb';
-  for (let n = 0; n < WAVE_LEN[phase]; n++) {
+  for (let n = 0; n < WAVE_LEN[levelIdx][phase]; n++) {
     const k = kinds[Math.floor(Math.random() * kinds.length)];
     const r = k === 'lowR' || k === 'beam' || (k === 'carpet' && (phase === 2 || levelIdx === 2)) ? randReality() : B;
     boss.queue.push({ k, wait: waitFor(prev, k, gap), r });
@@ -567,7 +576,7 @@ function fire(a) {
   } else if (a.k === 'carpet2') {
     add({ k: 'carpet', x, w: CARPET2_W, g, r: B });
     add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: B });
-    add({ k: 'rift', x: x + 520, y: floorY(g, 130), r: bossPhase() >= 1 ? randReality() : B });
+    add({ k: 'rift', x: x + 650, y: floorY(g, 130), r: bossPhase() >= 1 ? randReality() : B });
   }
 }
 
@@ -804,7 +813,7 @@ function update(dt) {
   // Player physics. g is 1 for normal gravity and -1 when flipped onto the ceiling;
   // landing on blocks of the current reality counts as ground on either side.
   const g = player.g;
-  player.vy += GRAVITY * g * dt;
+  player.vy += GRAVITY * g * (player.float ? RIFT_FLOAT : 1) * dt;
   const prevTop = player.y, prevBottom = player.y + SIZE;
   player.y += player.vy * dt;
   player.grounded = false;
@@ -835,6 +844,7 @@ function update(dt) {
     }
   }
 
+  if (player.grounded) player.float = false;
   if (jumpHeld) jump();
   if (player.grounded) {
     // Ease onto the nearest flat side instead of snapping.
