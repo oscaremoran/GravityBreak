@@ -1,0 +1,1683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gravity Break</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b14; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #editbar {
+    position: fixed; top: 0; left: 0; right: 0; display: none; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 8px 12px; background: rgba(8, 8, 18, 0.85); border-bottom: 1px solid rgba(255,255,255,0.15);
+    color: #fff; font-size: 13px; user-select: none;
+  }
+  #editbar button {
+    background: #1d1d33; color: #fff; border: 1px solid rgba(255,255,255,0.25); border-radius: 6px;
+    padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  #editbar button:hover { background: #2b2b4a; }
+  #editbar button.on { background: #fff; color: #111; }
+  #editbar .sep { width: 1px; height: 24px; background: rgba(255,255,255,0.2); margin: 0 4px; }
+  #editbar .title { font-weight: bold; margin-right: 6px; }
+  #editbar .saved { margin-left: auto; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="editbar">
+  <span class="title" id="editTitle"></span>
+  <span class="sep"></span>
+  <button data-tool="spike">1 Spike</button>
+  <button data-tool="hspike">2 Spike ▼</button>
+  <button data-tool="block">3 Block</button>
+  <button data-tool="slab">4 Slab</button>
+  <button data-tool="wall">5 Wall</button>
+  <button data-tool="gate">6 Gravity gate</button>
+  <button data-tool="rift">7 Rift</button>
+  <button data-tool="erase">8 Erase</button>
+  <span class="sep"></span>
+  <button data-real="0">Solar</button>
+  <button data-real="1">Lunar</button>
+  <button data-real="2">Both</button>
+  <span class="sep"></span>
+  <button id="bUndo">Undo</button>
+  <button id="bTestStart">▶ Test (P)</button>
+  <button id="bTestHere">▶ From here (T)</button>
+  <button id="bTestBoss">▶ Boss (B)</button>
+  <button id="bClear">Clear</button>
+  <button id="bReset">Reset to default</button>
+  <button id="bMenu">Menu</button>
+  <span class="saved" id="savedMsg"></span>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, GROUND, DPR = 1;
+let bgCache = {}, spriteCache = {};
+function resize() {
+  const oldGround = GROUND;
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth;
+  H = innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  GROUND = Math.floor(H * 0.75);
+  bgCache = {};
+  spriteCache = {};
+  // Keep an in-progress run laid out against the new ground line.
+  if (typeof obstacles !== 'undefined' && obstacles && level) {
+    layoutObstacles();
+    player.y += GROUND - oldGround;
+    prevY = player.y;
+  }
+}
+// Snap a coordinate to the device pixel grid so everything scrolls in lockstep.
+const snap = v => Math.round(v * DPR) / DPR;
+
+// Two realities, each with its own palette. Objects tagged 0 or 1 only exist
+// in that reality; tag 2 exists in both.
+const S = 0, L = 1, B = 2;
+const THEMES = [
+  { name: 'SOLAR', bg1: '#2a0f1f', bg2: '#5a1e2e', ground: '#ff7a3d', solid: '#ffb347', ghost: 'rgba(80,200,255,', player: '#ffe066' },
+  { name: 'LUNAR', bg1: '#071a2e', bg2: '#123a5a', ground: '#3dc8ff', solid: '#7fe3ff', ghost: 'rgba(255,170,70,', player: '#c8f7ff' },
+];
+const REAL_COLORS = ['#ffb347', '#7fe3ff', '#e8e8f0'];
+
+const SIZE = 40;           // one tile, in pixels
+const SPEED = 540;         // constant scroll speed, px/s
+const GRAVITY = 3800;
+const JUMP_V = -1060;
+const SPIN = 5.6;          // rad/s while airborne (about a half-turn per jump)
+const SHIFT_COOLDOWN = 0.25;
+const SHIFT_PAUSE = 0.035; // brief freeze after shifting so the player can adjust
+const WARP_TIME = 0.18;    // the warp animation starts during the freeze and finishes just after
+const WARP_RADIUS = 110;   // how far the warp ring spreads from the cube
+const STEP = 1 / 240;      // fixed physics step; rendering interpolates between steps
+const PLAYER_X = 160;
+const CEIL_ROWS = 9;       // playfield height in tiles; flipped gravity runs along the ceiling
+const CEIL = () => GROUND - CEIL_ROWS * SIZE;
+const PRESS_BUFFER = 0.12;
+const RIFT_R = 26;         // drawn radius of a rift
+const RIFT_HIT = 40;       // how close the cube must be to use a rift // a jump press stays live this long, so rifts are easy to hit
+const SOLID = new Set(['spike', 'hspike', 'block', 'wall']);
+const COLUMN = ['wall', 'gate'];   // objects that fill a whole column
+const TOOLS = ['spike', 'hspike', 'block', 'slab', 'wall', 'gate', 'rift', 'erase'];
+
+// --- Default levels ----------------------------------------------------------
+// Levels are lists of tile objects {t, x, y, r}: t is spike | hspike (hanging) | block |
+// slab | wall | gate (gravity flip) | rift (mid-air jump), x/y are tile coordinates
+// (y = 0 is the row sitting on the ground), r is reality.
+// The defaults are written with a small builder; `x` is the cursor.
+// Gaps between sections (3+ tiles) are stretched by SPREAD; tighter gaps inside a
+// single trick and negative cursor moves are left exact.
+const SPREAD = 1.5;
+function build(script, spread = SPREAD) {
+  const objs = [];
+  let x = 0;
+  const api = {
+    gap(t) { x += t >= 3 ? Math.round(t * spread) : t; },
+    spike(n = 1, r = B, y = 0) {
+      for (let i = 0; i < n; i++) objs.push({ t: 'spike', x: x + i, y, r });
+      x += n;
+    },
+    block(w, h, r = B) {
+      for (let i = 0; i < w; i++) for (let j = 0; j < h; j++) objs.push({ t: 'block', x: x + i, y: j, r });
+      x += w;
+    },
+    // Spikes hanging from the ceiling, for flipped-gravity sections.
+    hspike(n = 1, r = B) {
+      for (let i = 0; i < n; i++) objs.push({ t: 'hspike', x: x + i, y: CEIL_ROWS - 1, r });
+      x += n;
+    },
+    wall(r) { objs.push({ t: 'wall', x, y: 0, r }); x += 1; },
+    gate(r = B) { objs.push({ t: 'gate', x, y: 0, r }); x += 1; },
+    // A rift dx tiles ahead of the cursor at row y, without advancing.
+    rift(dx, y, r = B) { objs.push({ t: 'rift', x: x + dx, y, r }); },
+    // A wall in the current column without advancing, e.g. inside a spike row
+    // so the player has to shift mid-jump.
+    wallHere(r) { objs.push({ t: 'wall', x, y: 0, r }); },
+    // A spike pit with a floating slab bridge that only exists in reality r.
+    pit(n, r) {
+      for (let i = 0; i < n; i++) objs.push({ t: 'spike', x: x + 1 + i, y: 0, r: B });
+      for (let i = 0; i < n + 2; i++) objs.push({ t: 'slab', x: x + i, y: 1, r });
+      x += n + 2;
+    },
+    // A long pit whose bridge is r1 for the first half and r2 for the second,
+    // so the player has to shift while running across it.
+    switchPit(n, r1, r2) {
+      for (let i = 0; i < n * 2; i++) objs.push({ t: 'spike', x: x + 1 + i, y: 0, r: B });
+      for (let i = 0; i <= n; i++) objs.push({ t: 'slab', x: x + i, y: 1, r: r1 });
+      for (let i = n + 1; i < n * 2 + 2; i++) objs.push({ t: 'slab', x: x + i, y: 1, r: r2 });
+      x += n * 2 + 2;
+    },
+  };
+  script(api);
+  return objs;
+}
+
+const LEVEL_INFO = [
+  { name: 'Shift', diff: 'EASY', color: '#7dff9a', twist: 'Reality walls',
+    tip: 'Jump the spikes. Walls are too tall — shift reality to pass through them.' },
+  { name: 'Horizon', diff: 'NORMAL', color: '#ffd166', twist: 'Gravity gates',
+    tip: "NEW: Gravity gates flip you onto the ceiling and back — but only in the gate's reality." },
+  { name: 'Break', diff: 'HARD', color: '#ff5d73', twist: 'Rifts',
+    tip: 'NEW: Rifts — press jump while touching one in mid-air to jump again.' },
+];
+
+// Comments track which reality the player must be in after each section.
+const DEFAULT_LEVELS = [
+  build(l => {
+    l.gap(12);
+    l.spike(1); l.gap(7);
+    l.spike(2); l.gap(7);
+    l.spike(3); l.gap(9);
+    l.wall(S); l.gap(4);                                  // Lunar
+    l.spike(1, L); l.gap(7);
+    l.spike(1, S); l.gap(1); l.spike(1, L); l.gap(7);
+    l.wall(L); l.gap(5); l.wall(S); l.gap(8);             // Lunar
+    l.block(3, 1); l.gap(7);
+    l.spike(2); l.gap(7);
+    l.pit(6, L); l.gap(6);
+    l.wall(L); l.gap(4);                                  // Solar
+    l.spike(2, S); l.gap(8);
+    l.spike(1); l.wallHere(S); l.spike(2); l.gap(8);      // Lunar (shift mid-jump)
+    l.spike(2, L); l.gap(7);
+    l.wall(L); l.gap(5); l.wall(S); l.gap(5); l.wall(L); l.gap(8);  // Solar
+    l.pit(8, S); l.gap(8);
+    l.spike(3); l.gap(8);
+    l.block(4, 1); l.block(4, 2); l.gap(8);
+    l.spike(2);
+  }),
+  // Horizon: gravity gates. Comments also track gravity (up = on the ceiling).
+  build(l => {
+    // The opening is deliberately roomy so the first flips can be learned.
+    l.gap(12);
+    l.spike(1); l.gap(7);
+    l.spike(2); l.gap(14);
+    l.gate(); l.gap(16);                                  // up
+    l.hspike(1); l.gap(12);
+    l.hspike(2); l.gap(16);
+    l.gate(); l.gap(16);                                  // down
+    l.spike(2); l.gap(10);
+    l.gate(L); l.gap(10);                                 // Lunar-only gate: ignored while Solar
+    l.spike(1); l.gap(7);
+    l.wall(S); l.gap(5);                                  // Lunar
+    l.gate(L); l.gap(2); l.spike(12); l.gap(1);           // up, over a floor-spike carpet
+    l.gate(); l.gap(8);                                   // down
+    l.spike(2, L); l.gap(7);
+    l.wall(L); l.gap(6);                                  // Solar
+    l.gate(S); l.gap(8);                                  // up
+    l.hspike(3); l.gap(7);
+    l.hspike(1, S); l.gap(1); l.hspike(1, L); l.gap(7);
+    l.wall(S); l.gap(6);                                  // Lunar, still up
+    l.hspike(2, L); l.gap(8);
+    l.gate(L); l.gap(8);                                  // down
+    l.spike(1); l.wallHere(L); l.spike(2); l.gap(8);      // Solar (shift mid-jump)
+    l.gate(S); l.gap(2); l.spike(10); l.gap(1); l.gate(S); l.gap(8);  // up over a carpet, down again
+    // Shift after the Lunar gate, not before it, or it flips you into the ceiling spikes.
+    l.gate(L); l.gap(1); l.hspike(10); l.gap(-6); l.wall(S); l.gap(10);  // Lunar
+    l.spike(2); l.gap(7);
+    l.gate(); l.gap(8);                                   // up
+    l.hspike(2); l.gap(6);
+    l.wall(L); l.gap(6);                                  // Solar, up
+    l.hspike(2, S); l.gap(7);
+    l.gate(); l.gap(8);                                   // down
+    l.spike(3);
+  }),
+  // Break: the final level. Tight gaps (no extra spread) and every section is a rift trick.
+  build(l => {
+    l.gap(12);
+    l.rift(3, 3); l.spike(10); l.gap(5);
+    l.rift(3, 3); l.rift(11, 3); l.spike(18); l.gap(5);   // rift chain
+    l.rift(3, 3, L); l.spike(10); l.gap(4);               // shift to make the rift solid: Lunar
+    l.wall(L); l.gap(3);                                  // Solar
+    l.rift(3, 3, L); l.rift(11, 3, S); l.spike(18); l.gap(5);  // shift before each rift: Solar
+    l.spike(1); l.wallHere(S); l.spike(2); l.gap(4);      // Lunar
+    l.rift(3, 3, S); l.rift(11, 3, L); l.rift(19, 3, S); l.spike(26); l.gap(5);  // three rifts, three shifts: Solar
+    l.rift(3, 3); l.spike(6); l.wallHere(S); l.spike(5); l.gap(5);   // a wall inside a rift pit: Lunar
+    l.rift(2, 2); l.spike(3); l.block(6, 4); l.spike(6); l.gap(5);   // a pillar too tall to jump
+    l.gate(); l.gap(7);                                   // up
+    l.rift(3, 5, S); l.rift(11, 5); l.hspike(18); l.gap(5);  // upside-down chain: Solar
+    l.gate(); l.gap(7);                                   // down
+    l.rift(3, 3, L); l.rift(11, 3, S); l.rift(19, 3, L); l.spike(26); l.gap(4);  // Lunar
+    l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(10); l.gap(5);   // Solar, then shift back mid-air: Lunar
+    l.spike(3);
+  }, 1.2),
+];
+
+// --- Save data -----------------------------------------------------------------
+const SAVE_KEY = 'gravityBreakSave';
+const DEFAULTS_VERSION = 7;   // bumping this wipes best scores on next load
+let store = { version: DEFAULTS_VERSION, best: [0, 0, 0], levels: [null, null, null] };
+let storageOk = true;
+try {
+  const raw = localStorage.getItem(SAVE_KEY);
+  if (raw) applySave(JSON.parse(raw));
+} catch (e) { storageOk = false; }
+
+function applySave(data) {
+  if (!data || typeof data !== 'object') throw new Error('bad save');
+  if (Array.isArray(data.best)) store.best = [0, 1, 2].map(i => +data.best[i] || 0);
+  if (Array.isArray(data.levels)) store.levels = [0, 1, 2].map(i => Array.isArray(data.levels[i]) ? data.levels[i] : null);
+  if ((data.version || 1) < DEFAULTS_VERSION) {
+    store.best = [0, 0, 0];
+    store.version = DEFAULTS_VERSION;
+    save();
+  }
+}
+
+function save() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(store)); storageOk = true; }
+  catch (e) { storageOk = false; }
+}
+
+const levelObjs = i => store.levels[i] || DEFAULT_LEVELS[i];
+const levelLength = objs => Math.max(40, objs.reduce((m, o) => Math.max(m, o.x), 0) + 12);
+
+function exportSave() {
+  const code = btoa(unescape(encodeURIComponent(JSON.stringify(store))));
+  try { navigator.clipboard.writeText(code); } catch (e) {}
+  prompt('Your save code (copied to clipboard if allowed). Keep it somewhere safe:', code);
+}
+
+function resetProgress() {
+  if (!confirm('Reset all progress? This clears your best scores AND puts every level back to its original design.')) return;
+  store.best = [0, 0, 0];
+  store.levels = [null, null, null];
+  save();
+}
+
+function importSave() {
+  const code = prompt('Paste a save code:');
+  if (!code) return;
+  try {
+    applySave(JSON.parse(decodeURIComponent(escape(atob(code.trim())))));
+    save();
+    alert('Save loaded!');
+  } catch (e) { alert('That save code is not valid.'); }
+}
+
+// Pixel rect of a tile object (world x, screen y).
+function objRect(o) {
+  const x = o.x * SIZE;
+  if (o.t === 'wall') return { x: x + SIZE * 0.05, y: 0, w: SIZE * 0.9, h: GROUND };
+  if (o.t === 'gate') return { x: x + SIZE * 0.25, y: CEIL(), w: SIZE * 0.5, h: GROUND - CEIL() };
+  const h = o.t === 'slab' ? SIZE / 2 : SIZE;
+  return { x, y: GROUND - o.y * SIZE - h, w: SIZE, h };
+}
+
+// --- Game state ------------------------------------------------------------------
+let state = 'menu';          // menu | play | dead | win | edit
+let levelIdx = 0, level, obstacles, player, particles = [];
+let reality, cam, shiftTimer, flash, attempts, deadTimer;
+let testing = false, startCam = 0, startReality = S, pauseTimer = 0;
+let warp = null;             // { t, from }: a small warp burst around the player
+let pressBuffer = 0;         // time left on the most recent jump press (for rifts)
+let checkpoint = null;       // { cam, reality, g }: where the next attempt starts
+let cpFlash = 0;             // "CHECKPOINT" banner timer
+let buttons = [];
+
+// Checkpoints: one at the end of the section containing the level's halfway mark
+// (the first 3-column gap after it), and one at the start of the boss fight.
+function midCheckpoint(objs, length) {
+  const used = new Set(objs.map(o => o.x));
+  for (let c = Math.ceil(length / 2); c < length - 3; c++) {
+    if (!used.has(c) && !used.has(c + 1) && !used.has(c + 2)) return c + 1;
+  }
+  return null;
+}
+
+function makeLevel(i, objs) {
+  const length = levelLength(objs);
+  return { ...LEVEL_INFO[i], objs, length, cp: midCheckpoint(objs, length) };
+}
+
+function setCheckpoint(camX) {
+  if (checkpoint && checkpoint.cam === camX) return;
+  checkpoint = { cam: camX, reality, g: player.g };
+  cpFlash = 1.5;
+}
+
+function playLevel(i) {
+  levelIdx = i;
+  testing = false;
+  level = makeLevel(i, levelObjs(i));
+  startCam = 0; startReality = S;
+  attempts = 0;
+  checkpoint = null;
+  restart();
+}
+
+function restart() {
+  attempts++;
+  state = 'play';
+  const cp = checkpoint;
+  reality = cp ? cp.reality : startReality;
+  cam = cp ? cp.cam : startCam;
+  shiftTimer = 0;
+  pauseTimer = 0;
+  warp = null;
+  flash = 0;
+  const g = cp ? cp.g : 1;
+  player = { y: g === 1 ? GROUND - SIZE : CEIL(), vy: 0, rot: 0, grounded: true, g };
+  pressBuffer = 0;
+  boss = null;
+  shots = [];
+  layoutObstacles();
+  freezeRender();
+  setBar(false);
+}
+
+function layoutObstacles() {
+  obstacles = level.objs.map(o => {
+    const r = objRect(o);
+    return { t: o.t === 'slab' ? 'block' : o.t, r: o.r, wx: r.x, x: 0, y: r.y, w: r.w, h: r.h, used: false };
+  }).sort((a, b) => a.wx - b.wx);
+}
+
+// Screen x of every obstacle for a given camera position.
+function placeObstacles(camX) {
+  for (const o of obstacles) o.x = o.wx - camX + PLAYER_X;
+}
+
+// Values from the previous physics step, used to interpolate rendering.
+let prevCam = 0, prevY = 0, prevRot = 0;
+function freezeRender() { prevCam = cam; prevY = player.y; prevRot = player.rot; }
+
+const exists = o => o.r === B || o.r === reality;
+// The run is the first 80% of progress; damaging the Warden fills the rest.
+const progress = () => {
+  const run = Math.min(1, cam / (level.length * SIZE));
+  const fight = boss ? 1 - boss.hp / boss.max : 0;
+  return run * 0.8 + fight * 0.2;
+};
+
+function jump() {
+  if (state === 'play' && player.grounded) {
+    player.vy = JUMP_V * player.g;
+    player.grounded = false;
+    pressBuffer = 0;
+  }
+}
+
+function pressJump() {
+  jumpHeld = true;
+  pressBuffer = PRESS_BUFFER;
+  jump();
+}
+
+function flipGravity() {
+  player.g = -player.g;
+  player.grounded = false;
+  burst(PLAYER_X + SIZE / 2, player.y + SIZE / 2, '#fff', 12);
+}
+
+function riftHits(cx, cy) {
+  const px = PLAYER_X + 4, py = player.y + 4, ps = SIZE - 8;
+  const nx = Math.max(px, Math.min(cx, px + ps)), ny = Math.max(py, Math.min(cy, py + ps));
+  return (cx - nx) ** 2 + (cy - ny) ** 2 < RIFT_HIT * RIFT_HIT;
+}
+
+function useRift(cx, cy) {
+  player.vy = JUMP_V * player.g;
+  player.grounded = false;
+  pressBuffer = 0;
+  burst(cx, cy, '#fff', 14);
+}
+
+function shift() {
+  if (state !== 'play' || shiftTimer > 0) return;
+  reality = 1 - reality;
+  shiftTimer = SHIFT_COOLDOWN;
+  pauseTimer = SHIFT_PAUSE;
+  warp = { t: 0, from: 1 - reality };
+  // Shifting into something solid is fatal.
+  placeObstacles(cam);
+  for (const o of obstacles) if (SOLID.has(o.t) && exists(o) && hits(o)) { die(); return; }
+}
+
+function hits(o) {
+  const px = PLAYER_X + 4, py = player.y + 4, ps = SIZE - 8;
+  let ox = o.x, oy = o.y, ow = o.w, oh = o.h;
+  if (o.t === 'spike') { ox += 10; ow -= 20; oy += 14; oh -= 14; }
+  if (o.t === 'hspike') { ox += 10; ow -= 20; oh -= 14; }
+  return px < ox + ow && px + ps > ox && py < oy + oh && py + ps > oy;
+}
+
+function die() {
+  state = 'dead';
+  deadTimer = 0.8;
+  freezeRender();
+  burst(PLAYER_X + SIZE / 2, player.y + SIZE / 2, THEMES[reality].player, 40);
+  const pct = Math.floor(progress() * 100);
+  if (!testing && pct > store.best[levelIdx]) { store.best[levelIdx] = pct; save(); }
+}
+
+function win() {
+  state = 'win';
+  freezeRender();
+  if (!testing) { store.best[levelIdx] = 100; save(); }
+  for (let i = 0; i < 5; i++) burst(PLAYER_X + SIZE / 2, player.y, level.color, 30);
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 100 + Math.random() * 400;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.6 + Math.random() * 0.4, color });
+  }
+}
+
+// --- Boss: the Warden ---------------------------------------------------------------
+// Fought at the end of every level once the obstacle course runs out. For now each
+// Warden is named after its level. It attacks in waves; after each wave it rolls a
+// core along the floor, and running into the core (in its reality) damages it.
+// Every hit starts a new phase with new attacks. Three hits break it.
+const BOSS_HP = 3;
+const BOSS_GAP = [0.75, 0.72, 0.6];   // base seconds between attacks, per level
+const WAVE_LEN = [3, 4, 5];           // attacks per wave, per phase
+const BOSS_PHASES = [
+  // Shift: reality beams, then split walls and twin beams, then reality pulses that shift you.
+  [['beam', 'lowR', 'high', 'lowR'], ['beam', 'split', 'twin', 'lowR', 'high'], ['split', 'twin', 'pulse', 'lowR', 'beam']],
+  // Horizon: gravity gates and wave shots, then slams, then rapid flip-flops.
+  [['gate', 'low', 'high', 'wave'], ['gate', 'slam', 'wave', 'low'], ['slam', 'flipflop', 'wave', 'high', 'gate']],
+  // Break: rift carpets and needles from the start, then double-rift carpets in mixed realities.
+  [['carpet', 'needle', 'lowR', 'carpet'], ['carpet2', 'needle', 'carpet', 'lowR'], ['carpet2', 'needle', 'carpet2', 'lowR', 'needle']],
+];
+const PHASE_NAMES = ['', 'PHASE II', 'FINAL PHASE'];
+const SHOT_SPEED = 620;
+const SHOT_R = 15;
+const CARPET_W = 420, CARPET2_W = 800;
+const WAVE_SPEED = 2.6;               // how fast wave shots bob up and down (rad/s)
+const SPLIT_H = 90;                   // where a split wall changes reality, in px from the floor
+const NEEDLE_LO = 70, NEEDLE_HI = 200; // the gap in a needle wall, in px from the floor
+// Minimum seconds after each attack before the next one, so every pattern is fair.
+const AFTER = { split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.5, carpet2: 2.1 };
+const JUMPED = ['low', 'lowR', 'wave', 'needle', 'carpet', 'carpet2', 'slam', 'split'];
+// y for something `off` pixels from the floor the player will be standing on.
+const floorY = (g, off) => (g === 1 ? GROUND - off : CEIL() + off);
+let boss = null, shots = [];
+
+function startBoss() {
+  setCheckpoint(level.length * SIZE);
+  boss = { name: level.name.toUpperCase(), hp: BOSS_HP, max: BOSS_HP, t: 0, enter: 0, timer: 1.4, queue: [], hit: 0, dying: 0, g: player.g, banner: 0 };
+}
+
+const bossX = () => W - 150 + (1 - boss.enter) * (1 - boss.enter) * 320;
+const bossY = () => GROUND - 200 + Math.sin(boss.t * (1.8 + (boss.max - boss.hp) * 0.6)) * (25 + (boss.max - boss.hp) * 12);
+const randReality = () => (Math.random() < 0.5 ? S : L);
+const bossPhase = () => Math.min(2, boss.max - boss.hp);
+
+// Seconds to wait before attack k when the previous attack was prev.
+function waitFor(prev, k, gap) {
+  let wait = Math.max(gap, AFTER[prev] || 0);
+  // You can't be under something high while still in the air from jumping something.
+  if (JUMPED.includes(prev) && (k === 'high' || k === 'wave' || k === 'needle')) wait = Math.max(wait, 0.95);
+  if (['gate', 'slam', 'flipflop', 'carpet', 'carpet2'].includes(k)) wait = Math.max(wait, 1.0);
+  return wait;
+}
+
+function nextWave() {
+  const phase = bossPhase();
+  const gap = BOSS_GAP[levelIdx] * (1 - 0.08 * phase);
+  const kinds = BOSS_PHASES[levelIdx][phase];
+  let prev = 'orb';
+  for (let n = 0; n < WAVE_LEN[phase]; n++) {
+    const k = kinds[Math.floor(Math.random() * kinds.length)];
+    const r = k === 'lowR' || k === 'beam' || (k === 'carpet' && (phase === 2 || levelIdx === 2)) ? randReality() : B;
+    boss.queue.push({ k, wait: waitFor(prev, k, gap), r });
+    prev = k;
+  }
+  boss.queue.push({ k: 'orb', wait: waitFor(prev, 'orb', gap), r: B });   // cores exist in both realities
+}
+
+function fire(a) {
+  const x = bossX() - 40;
+  const g = boss.g;
+  const add = sh => shots.push({ px: sh.x, ...sh });
+  if (a.k === 'low' || a.k === 'lowR') add({ k: 'ball', x, y: floorY(g, SHOT_R + 2), r: a.r });
+  else if (a.k === 'high') add({ k: 'ball', x, y: floorY(g, 95), r: B });
+  else if (a.k === 'beam') add({ k: 'beam', x, r: a.r });
+  else if (a.k === 'orb') add({ k: 'orb', x, y: floorY(g, 22), r: a.r });
+  else if (a.k === 'split') {
+    // Bottom part in one reality, top part in the other: stay low in one, jump high in the other.
+    add({ k: 'split', x, g, low: randReality(), r: B });
+  } else if (a.k === 'twin') {
+    const r = randReality();
+    add({ k: 'beam', x, r });
+    add({ k: 'beam', x: x + SHOT_SPEED * 0.42, r: 1 - r });
+  } else if (a.k === 'pulse') add({ k: 'pulse', x, r: B });
+  else if (a.k === 'wave') add({ k: 'ball', x, y: floorY(g, 85), r: B, wave: g, wt: Math.random() * 6 });
+  else if (a.k === 'gate') {
+    add({ k: 'gate', x, r: B });
+    boss.g = -g;   // everything after this is aimed at the player's new floor
+  } else if (a.k === 'slam') {
+    add({ k: 'gate', x, r: B });
+    add({ k: 'ball', x: x + SHOT_SPEED * 0.75, y: floorY(-g, SHOT_R + 2), r: B });
+    boss.g = -g;
+  } else if (a.k === 'flipflop') {
+    add({ k: 'gate', x, r: B });
+    add({ k: 'gate', x: x + SHOT_SPEED * 0.9, r: B });
+  } else if (a.k === 'needle') add({ k: 'needle', x, g, r: B });
+  else if (a.k === 'carpet') {
+    add({ k: 'carpet', x, w: CARPET_W, g, r: B });
+    add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: a.r });
+  } else if (a.k === 'carpet2') {
+    add({ k: 'carpet', x, w: CARPET2_W, g, r: B });
+    add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: B });
+    add({ k: 'rift', x: x + 520, y: floorY(g, 130), r: bossPhase() >= 1 ? randReality() : B });
+  }
+}
+
+function shotHits(sh) {
+  const px = PLAYER_X + 4, py = player.y + 4, ps = SIZE - 8;
+  const overlapX = w => px < sh.x + w && px + ps > sh.x - w;
+  if (sh.k === 'beam') return overlapX(12);
+  if (sh.k === 'split') {
+    if (!overlapX(12)) return false;
+    const lo = sh.g === 1 ? GROUND - (py + ps) : py - CEIL();   // player's distance from the floor
+    return reality === sh.low ? lo < SPLIT_H : lo + ps > SPLIT_H;
+  }
+  if (sh.k === 'needle') {
+    if (!overlapX(12)) return false;
+    const lo = sh.g === 1 ? GROUND - (py + ps) : py - CEIL();   // player's distance from the floor
+    return lo < NEEDLE_LO || lo + ps > NEEDLE_HI;
+  }
+  if (sh.k === 'carpet') {
+    const top = sh.g === 1 ? GROUND - 26 : CEIL();
+    return px < sh.x + sh.w && px + ps > sh.x && py < top + 26 && py + ps > top;
+  }
+  const r = sh.k === 'orb' ? 22 : SHOT_R - 2;
+  const cx = Math.max(px, Math.min(sh.x, px + ps)), cy = Math.max(py, Math.min(sh.y, py + ps));
+  return (sh.x - cx) ** 2 + (sh.y - cy) ** 2 < r * r;
+}
+
+// A reality pulse shifts the player whether they like it or not.
+function forcedShift() {
+  reality = 1 - reality;
+  pauseTimer = SHIFT_PAUSE;
+  warp = { t: 0, from: 1 - reality };
+}
+
+function damageBoss() {
+  boss.hp--;
+  boss.hit = 1;
+  flash = 0.8;
+  burst(bossX(), bossY(), level.color, 30);
+  // Clear the field and start the next phase fresh.
+  shots = [];
+  boss.queue = [];
+  boss.g = player.g;
+  if (boss.hp <= 0) { boss.dying = 1.2; return; }
+  boss.timer = 1.6;
+  boss.banner = 1.4;
+}
+
+function updateBoss(dt) {
+  boss.t += dt;
+  boss.hit = Math.max(0, boss.hit - dt * 3);
+  boss.banner = Math.max(0, boss.banner - dt);
+  if (boss.dying > 0) {
+    boss.dying -= dt;
+    if (Math.random() < dt * 20) burst(bossX() + (Math.random() - 0.5) * 80, bossY() + (Math.random() - 0.5) * 80, level.color, 8);
+    if (boss.dying <= 0) win();
+    return;
+  }
+  if (boss.enter < 1) boss.enter = Math.min(1, boss.enter + dt * 0.8);
+  else {
+    if (!boss.queue.length) nextWave();
+    boss.timer -= dt;
+    if (boss.timer <= 0) {
+      fire(boss.queue.shift());
+      boss.timer = boss.queue.length ? boss.queue[0].wait : 1.0;
+    }
+  }
+  for (const sh of shots) {
+    sh.px = sh.x;
+    sh.x -= SHOT_SPEED * dt;
+    if (sh.wave) { sh.wt += dt; sh.y = floorY(sh.wave, 85 + 65 * Math.sin(sh.wt * WAVE_SPEED)); }
+  }
+  shots = shots.filter(sh => sh.x + (sh.w || 0) > -60 && !sh.gone);
+  for (const sh of shots) {
+    if (!exists(sh)) continue;
+    if (sh.k === 'gate' || sh.k === 'pulse') {
+      if (!sh.used && sh.x <= PLAYER_X + SIZE / 2) {
+        sh.used = true;
+        if (sh.k === 'gate') flipGravity(); else forcedShift();
+      }
+      continue;
+    }
+    if (sh.k === 'rift') {
+      if (!sh.used && pressBuffer > 0 && riftHits(sh.x, sh.y)) { sh.used = true; useRift(sh.x, sh.y); }
+      continue;
+    }
+    if (!shotHits(sh)) continue;
+    if (sh.k === 'orb') { sh.gone = true; damageBoss(); return; }
+    die();
+    return;
+  }
+}
+
+// --- Editor ------------------------------------------------------------------------
+const bar = document.getElementById('editbar');
+let editIdx = 0, editObjs = [], editCam = 0, tool = 'spike', editReal = S;
+let history = [], painting = null, strokeChanged = false, hover = null;
+
+function setBar(show) { bar.style.display = show ? 'flex' : 'none'; }
+
+function openEditor(i) {
+  editIdx = i;
+  editObjs = levelObjs(i).map(o => ({ ...o }));
+  editCam = 0;
+  history = [];
+  state = 'edit';
+  testing = false;
+  document.getElementById('editTitle').textContent = `Editing: ${i + 1} · ${LEVEL_INFO[i].name}`;
+  setBar(true);
+  refreshBar();
+}
+
+function backToEditor() {
+  state = 'edit';
+  setBar(true);
+  refreshBar();
+}
+
+function refreshBar() {
+  bar.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === tool));
+  bar.querySelectorAll('[data-real]').forEach(b => b.classList.toggle('on', +b.dataset.real === editReal));
+}
+
+let savedTimer;
+function commitEdit() {
+  store.levels[editIdx] = editObjs.map(o => ({ ...o }));
+  save();
+  const msg = document.getElementById('savedMsg');
+  msg.textContent = storageOk ? 'Saved ✓' : 'Could not save — use Export on the menu';
+  clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => { msg.textContent = ''; }, 1500);
+}
+
+function snapshot() {
+  history.push(JSON.stringify(editObjs));
+  if (history.length > 100) history.shift();
+}
+
+function undo() {
+  if (!history.length) return;
+  editObjs = JSON.parse(history.pop());
+  commitEdit();
+}
+
+function tileAt(mx, my) {
+  return { x: Math.floor((mx + editCam - PLAYER_X) / SIZE), y: Math.floor((GROUND - my) / SIZE) };
+}
+
+function applyTool(mx, my, erase) {
+  const { x, y } = tileAt(mx, my);
+  if (x < 0 || y < 0 || y >= CEIL_ROWS || my > GROUND) return;
+  const t = erase ? 'erase' : tool;
+  const before = editObjs.length;
+  const sig = JSON.stringify(editObjs.filter(o => o.x === x));
+  const isCol = o => COLUMN.includes(o.t);
+  if (t === 'erase') {
+    const i = editObjs.findIndex(o => o.x === x && o.y === y && !isCol(o));
+    if (i >= 0) editObjs.splice(i, 1);
+    else editObjs = editObjs.filter(o => !(isCol(o) && o.x === x));
+  } else if (COLUMN.includes(t)) {
+    editObjs = editObjs.filter(o => !(isCol(o) && o.x === x));
+    editObjs.push({ t, x, y: 0, r: editReal });
+  } else {
+    editObjs = editObjs.filter(o => !(!isCol(o) && o.x === x && o.y === y));
+    editObjs.push({ t, x, y, r: editReal });
+  }
+  if (editObjs.length !== before || JSON.stringify(editObjs.filter(o => o.x === x)) !== sig) strokeChanged = true;
+}
+
+function playtest(from) {
+  testing = true;
+  levelIdx = editIdx;
+  level = makeLevel(editIdx, editObjs);
+  startCam = from === 'here' ? Math.max(0, editCam) : from === 'boss' ? level.length * SIZE : 0;
+  startReality = from === 'here' && editReal !== B ? editReal : S;
+  attempts = 0;
+  checkpoint = null;
+  restart();
+}
+
+function clearLevel() {
+  if (!confirm('Remove everything from this level?')) return;
+  snapshot();
+  editObjs = [];
+  commitEdit();
+}
+
+function resetLevel() {
+  if (!confirm('Replace this level with the original design?')) return;
+  snapshot();
+  editObjs = DEFAULT_LEVELS[editIdx].map(o => ({ ...o }));
+  commitEdit();
+}
+
+bar.addEventListener('mousedown', e => e.stopPropagation());
+bar.querySelectorAll('[data-tool]').forEach(b => b.onclick = () => { tool = b.dataset.tool; refreshBar(); });
+bar.querySelectorAll('[data-real]').forEach(b => b.onclick = () => { editReal = +b.dataset.real; refreshBar(); });
+document.getElementById('bUndo').onclick = undo;
+document.getElementById('bTestStart').onclick = () => playtest('start');
+document.getElementById('bTestHere').onclick = () => playtest('here');
+document.getElementById('bTestBoss').onclick = () => playtest('boss');
+document.getElementById('bClear').onclick = clearLevel;
+document.getElementById('bReset').onclick = resetLevel;
+document.getElementById('bMenu').onclick = () => { state = 'menu'; setBar(false); };
+
+// --- Update ----------------------------------------------------------------
+const keys = new Set();
+
+function update(dt) {
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 900 * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  flash = Math.max(0, flash - dt * 4);
+  cpFlash = Math.max(0, cpFlash - dt);
+  if (warp && (warp.t += dt) >= WARP_TIME) warp = null;
+
+  if (state === 'edit') {
+    const dir = (keys.has('ArrowRight') || keys.has('KeyD') ? 1 : 0) - (keys.has('ArrowLeft') || keys.has('KeyA') ? 1 : 0);
+    editCam = Math.max(0, editCam + dir * (keys.has('ShiftLeft') ? 2000 : 800) * dt);
+    return;
+  }
+  if (state === 'dead') {
+    deadTimer -= dt;
+    if (deadTimer <= 0) restart();
+    return;
+  }
+  if (state !== 'play') return;
+
+  freezeRender();
+  if (pauseTimer > 0) { pauseTimer -= dt; return; }
+  cam += SPEED * dt;
+  shiftTimer = Math.max(0, shiftTimer - dt);
+  placeObstacles(cam);
+  if (level.cp !== null && !boss && startCam < level.cp * SIZE && cam >= level.cp * SIZE) setCheckpoint(level.cp * SIZE);
+
+  // Player physics. g is 1 for normal gravity and -1 when flipped onto the ceiling;
+  // landing on blocks of the current reality counts as ground on either side.
+  const g = player.g;
+  player.vy += GRAVITY * g * dt;
+  const prevTop = player.y, prevBottom = player.y + SIZE;
+  player.y += player.vy * dt;
+  player.grounded = false;
+  if (player.y + SIZE >= GROUND) { player.y = GROUND - SIZE; player.vy = 0; if (g === 1) player.grounded = true; }
+  if (player.y <= CEIL()) { player.y = CEIL(); player.vy = 0; if (g === -1) player.grounded = true; }
+  pressBuffer = Math.max(0, pressBuffer - dt);
+
+  for (const o of obstacles) {
+    if (o.x > PLAYER_X + SIZE || o.x + o.w < PLAYER_X) continue;
+    if (!exists(o)) continue;
+    if (o.t === 'gate') {
+      if (!o.used && o.x + o.w / 2 <= PLAYER_X + SIZE / 2) { o.used = true; flipGravity(); }
+      continue;
+    }
+    if (o.t === 'rift') {
+      const cx = o.x + o.w / 2, cy = o.y + o.h / 2;
+      if (!o.used && pressBuffer > 0 && riftHits(cx, cy)) { o.used = true; useRift(cx, cy); }
+      continue;
+    }
+    if (!hits(o)) continue;
+    if (o.t === 'block' && g === 1 && prevBottom <= o.y + 10 && player.vy >= 0) {
+      player.y = o.y - SIZE; player.vy = 0; player.grounded = true;
+    } else if (o.t === 'block' && g === -1 && prevTop >= o.y + o.h - 10 && player.vy <= 0) {
+      player.y = o.y + o.h; player.vy = 0; player.grounded = true;
+    } else {
+      die();
+      return;
+    }
+  }
+
+  if (jumpHeld) jump();
+  if (player.grounded) {
+    // Ease onto the nearest flat side instead of snapping.
+    const target = Math.round(player.rot / (Math.PI / 2)) * (Math.PI / 2);
+    player.rot += (target - player.rot) * Math.min(1, dt * 25);
+  } else {
+    player.rot += dt * SPIN * player.g;
+  }
+
+  if (!boss && cam >= level.length * SIZE) startBoss();
+  if (boss) updateBoss(dt);
+}
+
+// --- Draw ------------------------------------------------------------------
+// Gravity gate: a translucent band between floor and ceiling with up/down chevrons.
+function drawGate(x, w, live, color) {
+  const top = CEIL(), h = GROUND - top;
+  ctx.save();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = color;
+  if (live) {
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.3;
+    ctx.fillRect(x, top, w, h);
+    ctx.globalAlpha = 1;
+  } else {
+    ctx.setLineDash([6, 6]);
+  }
+  ctx.strokeRect(x, top, w, h);
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  for (let y = top + 24; y < GROUND - 30; y += 60) {
+    ctx.moveTo(x + 3, y + 6); ctx.lineTo(x + w / 2, y); ctx.lineTo(x + w - 3, y + 6);
+    ctx.moveTo(x + 3, y + 18); ctx.lineTo(x + w / 2, y + 24); ctx.lineTo(x + w - 3, y + 18);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Rift: a pulsing ring with a spinning core; dims once used.
+function drawRift(cx, cy, live, color, used) {
+  const t = performance.now() / 1000;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.globalAlpha = used ? 0.25 : 1;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color;
+  if (!live) ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.arc(0, 0, RIFT_R + Math.sin(t * 8) * 3, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = 2;
+  ctx.globalAlpha *= 0.5;
+  ctx.beginPath(); ctx.arc(0, 0, RIFT_R * 0.65, 0, Math.PI * 2); ctx.stroke();
+  ctx.globalAlpha = used ? 0.25 : 1;
+  if (live) {
+    const d = RIFT_R * 0.45;
+    ctx.rotate(t * 4);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.moveTo(0, -d); ctx.lineTo(d, 0); ctx.lineTo(0, d); ctx.lineTo(-d, 0); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawShape(t, x, y, w, h) {
+  if (t === 'gate') return drawGate(x, w, true, ctx.fillStyle);
+  if (t === 'rift') return drawRift(x + w / 2, y + h / 2, true, ctx.fillStyle, false);
+  if (t === 'spike' || t === 'hspike') {
+    const path = new Path2D();
+    addShape(path, t, x, y, w, h);
+    ctx.fill(path);
+    ctx.stroke(path);
+  } else {
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+    if (t === 'wall') {
+      ctx.fillStyle = 'rgba(0,0,0,0.15)';
+      for (let yy = y + 20; yy < GROUND; yy += 40) ctx.fillRect(x, yy, w, 6);
+    }
+  }
+}
+
+function addShape(path, t, x, y, w, h) {
+  if (t === 'spike') {
+    path.moveTo(x, y + h);
+    path.lineTo(x + w / 2, y);
+    path.lineTo(x + w, y + h);
+    path.closePath();
+  } else if (t === 'hspike') {
+    path.moveTo(x, y);
+    path.lineTo(x + w / 2, y + h);
+    path.lineTo(x + w, y);
+    path.closePath();
+  } else {
+    path.rect(x, y, w, h);
+  }
+}
+
+// Draws all visible obstacles in a few batched paths (ghosts, solids, both-reality).
+function drawObstacles() {
+  const th = THEMES[reality];
+  const ghosts = new Path2D(), solids = new Path2D(), boths = new Path2D(), stripes = new Path2D();
+  const specials = [];
+  for (const o of obstacles) {
+    if (o.x > W + 20) break;
+    if (o.x + o.w < -20) continue;
+    if (o.t === 'gate' || o.t === 'rift') { specials.push(o); continue; }
+    const live = exists(o);
+    addShape(!live ? ghosts : o.r === B ? boths : solids, o.t, o.x, o.y, o.w, o.h);
+    if (live && o.t === 'wall') for (let y = o.y + 20; y < GROUND; y += 40) stripes.rect(o.x, y, o.w, 6);
+  }
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 6]);
+  ctx.fillStyle = th.ghost + '0.1)';
+  ctx.strokeStyle = th.ghost + '0.5)';
+  ctx.fill(ghosts);
+  ctx.stroke(ghosts);
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillStyle = th.solid;
+  ctx.fill(solids);
+  ctx.stroke(solids);
+  ctx.fillStyle = REAL_COLORS[B];
+  ctx.fill(boths);
+  ctx.stroke(boths);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fill(stripes);
+  for (const o of specials) {
+    const live = exists(o);
+    const color = !live ? th.ghost + '0.6)' : o.r === B ? REAL_COLORS[B] : th.solid;
+    if (o.t === 'gate') drawGate(o.x, o.w, live, color);
+    else drawRift(o.x + o.w / 2, o.y + o.h / 2, live, color, o.used);
+  }
+}
+
+// Pre-rendered glowing cube per theme (shadowBlur every frame is expensive).
+function playerSprite(th) {
+  if (spriteCache[th.name]) return spriteCache[th.name];
+  const pad = 30, size = SIZE + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = c.height = Math.ceil(size * DPR);
+  const g = c.getContext('2d');
+  g.scale(DPR, DPR);
+  g.shadowColor = th.player;
+  g.shadowBlur = 20;
+  g.fillStyle = th.player;
+  g.fillRect(pad, pad, SIZE, SIZE);
+  g.shadowBlur = 0;
+  g.fillStyle = 'rgba(0,0,0,0.25)';
+  g.fillRect(pad + 8, pad + 8, SIZE - 16, SIZE - 16);
+  return spriteCache[th.name] = { canvas: c, size };
+}
+
+function drawBackground(th, scroll) {
+  if (!bgCache[th.name]) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, th.bg1); g.addColorStop(1, th.bg2);
+    bgCache[th.name] = g;
+  }
+  ctx.fillStyle = bgCache[th.name];
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  const off = snap(-(scroll * 0.3) % 80);
+  ctx.beginPath();
+  for (let x = off; x < W; x += 80) { ctx.moveTo(x, 0); ctx.lineTo(x, GROUND); }
+  ctx.stroke();
+  ctx.fillStyle = th.ground;
+  ctx.fillRect(0, GROUND, W, 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, GROUND + 4, W, H - GROUND);
+  // Ceiling: where flipped gravity takes you.
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillRect(0, 0, W, CEIL());
+  ctx.globalAlpha = 0.5;
+  ctx.fillStyle = th.ground;
+  ctx.fillRect(0, CEIL() - 2, W, 2);
+  ctx.globalAlpha = 1;
+}
+
+function drawButton(x, y, w, h, label, color, onClick) {
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 15px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, x + w / 2, y + h / 2 + 5);
+  buttons.push({ x, y, w, h, onClick });
+}
+
+function drawMenu(t) {
+  buttons = [];
+  drawBackground(THEMES[Math.floor(t / 2) % 2], t * 200);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 60px system-ui';
+  ctx.fillText('GRAVITY BREAK', W / 2, H * 0.15);
+  ctx.font = '16px system-ui';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText('Left click / Space / ↑ — Jump (hold to keep jumping)      Right click / Shift / S — Shift reality      Esc — Back', W / 2, H * 0.15 + 38);
+  ctx.fillText('White objects exist in both realities. Every level adds a new twist, and ends with a Warden boss —', W / 2, H * 0.15 + 62);
+  ctx.fillText('dodge its attacks and run into the cores it rolls along the floor. Three hits and it breaks.', W / 2, H * 0.15 + 84);
+
+  const cw = Math.min(260, (W - 80) / 3), ch = 160, gap = 20;
+  const total = cw * 3 + gap * 2;
+  const top = H * 0.33;
+  LEVEL_INFO.forEach((lv, i) => {
+    const x = W / 2 - total / 2 + i * (cw + gap), y = top;
+    buttons.push({ x, y, w: cw, h: ch, onClick: () => playLevel(i) });
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x, y, cw, ch);
+    ctx.strokeStyle = lv.color;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, cw, ch);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = lv.color;
+    ctx.font = 'bold 14px system-ui';
+    ctx.fillText(`${i + 1} · ${lv.diff}${store.levels[i] ? ' · CUSTOM' : ''}`, x + cw / 2, y + 30);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 26px system-ui';
+    ctx.fillText(lv.name, x + cw / 2, y + 62);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '13px system-ui';
+    ctx.fillText(lv.twist, x + cw / 2, y + 82);
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(x + 20, y + 94, cw - 40, 12);
+    ctx.fillStyle = lv.color;
+    ctx.fillRect(x + 20, y + 94, (cw - 40) * store.best[i] / 100, 12);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '15px system-ui';
+    ctx.fillText(store.best[i] === 100 ? '★ COMPLETE' : `Best ${store.best[i]}%`, x + cw / 2, y + 134);
+    drawButton(x, y + ch + 10, cw, 36, '✎ Edit level', lv.color, () => openEditor(i));
+  });
+
+  const by = top + ch + 76, bw = 160;
+  drawButton(W / 2 - bw * 1.5 - 20, by, bw, 36, 'Export save', '#aaa', exportSave);
+  drawButton(W / 2 - bw / 2, by, bw, 36, 'Import save', '#aaa', importSave);
+  drawButton(W / 2 + bw / 2 + 20, by, bw, 36, 'Reset progress', '#ff8080', resetProgress);
+  ctx.textAlign = 'center';
+  ctx.font = '14px system-ui';
+  ctx.fillStyle = storageOk ? 'rgba(255,255,255,0.55)' : '#ff8080';
+  ctx.fillText(storageOk
+    ? 'Progress and level designs save automatically. Use Export to back them up.'
+    : 'This browser is blocking saves — use Export/Import to keep your progress.', W / 2, by + 64);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('Click a level or press 1 / 2 / 3 to play', W / 2, by + 86);
+}
+
+function drawEditor() {
+  const th = THEMES[editReal === L ? L : S];
+  drawBackground(th, editCam);
+
+  const sx = x => x * SIZE - editCam + PLAYER_X;
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 1;
+  const first = Math.floor(editCam / SIZE) - 4;
+  ctx.beginPath();
+  for (let x = first; x < first + W / SIZE + 6; x++) { ctx.moveTo(sx(x), CEIL()); ctx.lineTo(sx(x), GROUND); }
+  for (let y = GROUND; y >= CEIL(); y -= SIZE) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.font = '12px system-ui';
+  ctx.textAlign = 'left';
+  for (let x = Math.max(0, Math.ceil(first / 10) * 10); x < first + W / SIZE + 6; x += 10) ctx.fillText(x, sx(x) + 3, GROUND + 18);
+
+  // Start position and finish line
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillRect(sx(0), GROUND - SIZE, SIZE, SIZE);
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText('START', sx(0) + SIZE / 2, GROUND - SIZE - 6);
+  const bx = sx(levelLength(editObjs));
+  ctx.fillStyle = 'rgba(255,60,90,0.25)';
+  ctx.fillRect(bx, 0, W, GROUND);
+  ctx.fillStyle = '#ff5d73';
+  ctx.fillRect(bx, 0, 4, GROUND);
+  ctx.font = 'bold 16px system-ui';
+  ctx.textAlign = 'left';
+  ctx.fillText(`BOSS: ${LEVEL_INFO[editIdx].name.toUpperCase()} →  (checkpoint)`, bx + 12, GROUND - 12);
+  const cp = midCheckpoint(editObjs, levelLength(editObjs));
+  if (cp !== null) {
+    const cx = sx(cp) + SIZE / 2;
+    ctx.save();
+    ctx.strokeStyle = '#fff';
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.moveTo(cx, CEIL()); ctx.lineTo(cx, GROUND); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('CHECKPOINT (auto, halfway)', cx, CEIL() - 8);
+  }
+
+  // Objects, colored by reality
+  for (const o of editObjs) {
+    const r = objRect(o);
+    const x = r.x - editCam + PLAYER_X;
+    if (x > W || x + r.w < 0) continue;
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.fillStyle = REAL_COLORS[o.r];
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    if (o.t === 'wall') ctx.globalAlpha = 0.85;
+    drawShape(o.t, x, r.y, r.w, r.h);
+    ctx.restore();
+  }
+
+  // Hover preview
+  if (hover) {
+    const { x, y } = tileAt(hover.x, hover.y);
+    if (x >= 0 && y >= 0 && y < CEIL_ROWS && hover.y <= GROUND) {
+      ctx.save();
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 2;
+      if (tool === 'erase') {
+        ctx.strokeStyle = '#ff5050';
+        ctx.strokeRect(sx(x), GROUND - (y + 1) * SIZE, SIZE, SIZE);
+      } else {
+        const r = objRect({ t: tool, x, y });
+        ctx.fillStyle = REAL_COLORS[editReal];
+        ctx.strokeStyle = '#fff';
+        drawShape(tool, r.x - editCam + PLAYER_X, r.y, r.w, r.h);
+      }
+      ctx.restore();
+    }
+  }
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.font = '14px system-ui';
+  const lines = [
+    'Left click: place  ·  Right click: erase  ·  Scroll / A D / ← →: move (hold Shift = fast)',
+    'Q: cycle reality  ·  Ctrl/Cmd+Z: undo  ·  P: test from start  ·  T: test from here  ·  B: test boss  ·  Esc: menu',
+    'Solar = orange, Lunar = blue, Both = white. Slabs: half-height platforms. Spike ▼ hangs from the ceiling.',
+    'Gravity gates flip gravity when passed in their reality. Rifts give a mid-air jump when you press jump on them.',
+  ];
+  lines.forEach((s, i) => ctx.fillText(s, 16, GROUND + 44 + i * 20));
+}
+
+function drawBall(x, y, r, color, live, spin) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(spin);
+  ctx.beginPath();
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2, rr = i % 2 ? r : r + 6;
+    ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  ctx.closePath();
+  ctx.lineWidth = 2;
+  if (live) {
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  } else {
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.5;
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// The Warden. Each level's Warden has its own body; all share the eye, which tracks
+// the player and turns red on the last hit. A defeated Warden has an X for an eye.
+//   style 0 (Shift):   a square split into Solar and Lunar halves
+//   style 1 (Horizon): a diamond that keeps flipping over its horizon line
+//   style 2 (Break):   a cracked block with orbiting shards; cracks grow with damage
+function drawWarden(x, y, scale, t, color, ex, ey, angry, defeated, style, cracks) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 4;
+  if (style === 0) {
+    ctx.rotate(t * 0.8);
+    const flashing = color === '#fff';
+    ctx.fillStyle = flashing ? '#fff' : REAL_COLORS[S];
+    ctx.fillRect(-48, -48, 48, 96);
+    ctx.fillStyle = flashing ? '#fff' : REAL_COLORS[L];
+    ctx.fillRect(0, -48, 48, 96);
+    ctx.strokeStyle = color;
+    ctx.strokeRect(-48, -48, 96, 96);
+  } else if (style === 1) {
+    ctx.scale(1, Math.max(0.35, Math.abs(Math.cos(t * 1.4))));
+    ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = color;
+    ctx.fillRect(-44, -44, 88, 88);
+    ctx.strokeRect(-44, -44, 88, 88);
+    ctx.rotate(-Math.PI / 4);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(-70, 0); ctx.lineTo(70, 0); ctx.stroke();
+  } else {
+    ctx.rotate(t * 0.3);
+    ctx.fillStyle = color;
+    ctx.fillRect(-48, -48, 96, 96);
+    ctx.strokeRect(-48, -48, 96, 96);
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let c = 0; c < cracks; c++) {
+      const a = c * 2.1 + 0.4;
+      ctx.moveTo(Math.cos(a) * 24, Math.sin(a) * 24);
+      ctx.lineTo(Math.cos(a + 0.3) * 38, Math.sin(a + 0.3) * 38);
+      ctx.lineTo(Math.cos(a) * 50, Math.sin(a) * 50);
+    }
+    ctx.stroke();
+    ctx.fillStyle = color;
+    for (let k = 0; k < 4; k++) {
+      const a = -t * 1.5 + k * Math.PI / 2;
+      ctx.save();
+      ctx.translate(Math.cos(a) * 78, Math.sin(a) * 78);
+      ctx.rotate(a * 2);
+      ctx.beginPath(); ctx.moveTo(0, -10); ctx.lineTo(9, 8); ctx.lineTo(-9, 8); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI * 2); ctx.fill();
+  if (defeated) {
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(-9, -9); ctx.lineTo(9, 9); ctx.moveTo(9, -9); ctx.lineTo(-9, 9);
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = angry ? '#ff3b3b' : '#fff';
+    ctx.beginPath(); ctx.arc(ex, ey, 9, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawBoss(alpha) {
+  const th = THEMES[reality];
+  const shotColor = sh => (sh.r === B ? REAL_COLORS[B] : th.solid);
+  for (const sh of shots) {
+    const x = sh.px + (sh.x - sh.px) * alpha;
+    const live = exists(sh);
+    const color = live ? shotColor(sh) : th.ghost + '1)';
+    if (sh.k === 'gate') drawGate(x - 10, 20, live, color);
+    else if (sh.k === 'rift') drawRift(x, sh.y, live, live ? (sh.r === B ? '#fff' : color) : color, sh.used);
+    else if (sh.k === 'carpet') {
+      const path = new Path2D();
+      for (let cx = x; cx < x + sh.w; cx += SIZE) {
+        if (sh.g === 1) addShape(path, 'spike', cx, GROUND - SIZE, SIZE, SIZE);
+        else addShape(path, 'hspike', cx, CEIL(), SIZE, SIZE);
+      }
+      ctx.fillStyle = REAL_COLORS[B];
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 2;
+      ctx.fill(path);
+      ctx.stroke(path);
+    } else if (sh.k === 'pulse') {
+      // Reality pulse: half Solar, half Lunar.
+      const top = CEIL(), h = GROUND - top;
+      ctx.save();
+      ctx.globalAlpha = 0.6;
+      ctx.fillStyle = REAL_COLORS[S];
+      ctx.fillRect(x - 12, top, 12, h);
+      ctx.fillStyle = REAL_COLORS[L];
+      ctx.fillRect(x, top, 12, h);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x - 12, top, 24, h);
+      ctx.restore();
+    } else if (sh.k === 'split') {
+      // Each part is solid only in its own reality; the other part is drawn as a ghost.
+      const floor = sh.g === 1 ? GROUND : CEIL(), far = sh.g === 1 ? CEIL() : GROUND, mid = floorY(sh.g, SPLIT_H);
+      ctx.save();
+      ctx.lineWidth = 2;
+      for (const [y0, y1, r] of [[floor, mid, sh.low], [mid, far, 1 - sh.low]]) {
+        const top = Math.min(y0, y1), h = Math.abs(y1 - y0);
+        if (r === reality) {
+          ctx.fillStyle = th.solid;
+          ctx.strokeStyle = '#fff';
+          ctx.fillRect(x - 12, top, 24, h);
+        } else {
+          ctx.setLineDash([6, 6]);
+          ctx.fillStyle = th.ghost + '0.15)';
+          ctx.strokeStyle = th.ghost + '0.6)';
+          ctx.fillRect(x - 12, top, 24, h);
+        }
+        ctx.strokeRect(x - 12, top, 24, h);
+        ctx.setLineDash([]);
+      }
+      ctx.restore();
+    } else if (sh.k === 'needle') {
+      // A wall with a gap you have to jump through.
+      const a = floorY(sh.g, NEEDLE_LO), b = floorY(sh.g, NEEDLE_HI);
+      const floor = sh.g === 1 ? GROUND : CEIL(), far = sh.g === 1 ? CEIL() : GROUND;
+      ctx.save();
+      ctx.fillStyle = REAL_COLORS[B];
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 2;
+      for (const [y0, y1] of [[floor, a], [b, far]]) {
+        ctx.fillRect(x - 12, Math.min(y0, y1), 24, Math.abs(y1 - y0));
+        ctx.strokeRect(x - 12, Math.min(y0, y1), 24, Math.abs(y1 - y0));
+      }
+      ctx.strokeStyle = level.color;
+      ctx.setLineDash([4, 4]);
+      ctx.strokeRect(x - 12, Math.min(a, b), 24, Math.abs(b - a));
+      ctx.restore();
+    } else if (sh.k === 'beam') {
+      ctx.save();
+      ctx.globalAlpha = live ? 0.9 : 0.35;
+      if (!live) ctx.setLineDash([6, 6]);
+      ctx.fillStyle = live ? color : th.ghost + '0.15)';
+      ctx.fillRect(x - 12, 0, 24, GROUND);
+      ctx.strokeStyle = live ? '#fff' : color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x - 12, 0, 24, GROUND);
+      ctx.restore();
+    } else if (sh.k === 'orb') {
+      const pulse = 1 + Math.sin(boss.t * 10) * 0.15;
+      ctx.save();
+      ctx.translate(x, sh.y);
+      ctx.globalAlpha = live ? 1 : 0.45;
+      ctx.strokeStyle = live ? REAL_COLORS[sh.r] : color;
+      ctx.lineWidth = 3;
+      if (!live) ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.arc(0, 0, 20 * pulse, 0, Math.PI * 2); ctx.stroke();
+      ctx.rotate(boss.t * 3);
+      ctx.fillStyle = live ? '#fff' : 'transparent';
+      ctx.fillRect(-7, -7, 14, 14);
+      ctx.restore();
+    } else {
+      drawBall(x, sh.y, SHOT_R, live ? color : color, live, boss.t * 8);
+    }
+  }
+
+  // The Warden itself (hidden on the win screen, which shows it instead)
+  if (state !== 'win') {
+    const x = bossX(), y = bossY();
+    const shake = boss.dying > 0 ? (Math.random() - 0.5) * 12 : 0;
+    const scale = boss.dying > 0 ? Math.max(0.05, boss.dying / 1.2) : 1;
+    const ex = Math.max(-8, Math.min(8, (PLAYER_X - x) / 60)), ey = Math.max(-8, Math.min(8, (player.y - y) / 30));
+    drawWarden(x + shake, y + shake, scale, boss.t, boss.hit > 0 ? '#fff' : level.color, ex, ey, boss.hp <= 1, false, levelIdx, boss.max - boss.hp);
+    // Telegraph: a ring in the next attack's colour closes in just before it fires.
+    const next = boss.queue[0];
+    if (boss.enter >= 1 && !boss.dying && next && boss.timer < 0.4) {
+      ctx.save();
+      ctx.globalAlpha = 1 - boss.timer / 0.4;
+      ctx.strokeStyle = next.k === 'orb' ? '#7dff9a' : REAL_COLORS[next.r];
+      ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(x, y, 62 + boss.timer * 150, 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+  }
+  if (boss.banner > 0 && state !== 'win') {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, boss.banner * 2);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = level.color;
+    ctx.font = 'bold 48px system-ui';
+    ctx.fillText(PHASE_NAMES[boss.max - boss.hp] || '', W / 2, H * 0.32);
+    ctx.restore();
+  }
+
+  // Name card while entering
+  if (boss.enter < 1 && state !== 'win') {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, (1 - boss.enter) * 2);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = level.color;
+    ctx.font = 'bold 64px system-ui';
+    ctx.fillText(boss.name, W / 2, H * 0.32);
+    ctx.restore();
+  }
+}
+
+// A compact warp burst around the cube: the new reality's colour expands in a small
+// disc with a shock ring and speed streaks, fading as it grows.
+function drawWarp(drawWorld, rY) {
+  drawWorld();
+  const p = warp.t / WARP_TIME;
+  const cx = PLAYER_X + SIZE / 2, cy = rY + SIZE / 2;
+  const R = SIZE * 0.6 + WARP_RADIUS * (1 - (1 - p) ** 3);
+  const fade = 1 - p;
+  ctx.save();
+  ctx.globalAlpha = 0.25 * fade;
+  ctx.fillStyle = THEMES[reality].player;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = fade;
+  ctx.lineWidth = 2 + 4 * fade;
+  ctx.strokeStyle = '#fff';
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = THEMES[warp.from].player;
+  ctx.beginPath(); ctx.arc(cx, cy, Math.max(0, R - 8), 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = THEMES[reality].player;
+  ctx.beginPath();
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2 + i * 0.37;
+    const r0 = R * 0.7, r1 = R * 1.15;
+    ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+    ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Checkpoint flag on the ground; lit once reached.
+function drawFlag(x, reached) {
+  if (x < -40 || x > W + 40) return;
+  ctx.save();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(x - 2, GROUND - 80, 4, 80);
+  ctx.fillStyle = reached ? level.color : 'rgba(255,255,255,0.35)';
+  ctx.beginPath(); ctx.moveTo(x + 2, GROUND - 80); ctx.lineTo(x + 36, GROUND - 68); ctx.lineTo(x + 2, GROUND - 56); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawGame(alpha) {
+  const th = THEMES[reality];
+  // Interpolate between the last two physics steps for smooth motion at any refresh rate.
+  const rCam = snap(prevCam + (cam - prevCam) * alpha);
+  const rY = prevY + (player.y - prevY) * alpha;
+  const rRot = prevRot + (player.rot - prevRot) * alpha;
+
+  placeObstacles(rCam);
+  const drawWorld = () => {
+    drawBackground(THEMES[reality], rCam);
+    drawObstacles();
+    if (level.cp !== null) drawFlag(level.cp * SIZE - rCam + PLAYER_X + SIZE / 2, checkpoint && checkpoint.cam >= level.cp * SIZE);
+    if (boss) drawBoss(alpha);
+  };
+  if (warp) drawWarp(drawWorld, rY);
+  else drawWorld();
+
+  if (state !== 'dead') {
+    const sp = playerSprite(th);
+    ctx.save();
+    ctx.translate(PLAYER_X + SIZE / 2, rY + SIZE / 2);
+    if (warp) {
+      // Stretch along the direction of travel at the start of the warp, then settle.
+      const k = Math.max(0, 1 - (warp.t / WARP_TIME) * 2.5);
+      ctx.scale(1 + 0.5 * k, 1 - 0.3 * k);
+    }
+    ctx.rotate(rRot);
+    ctx.drawImage(sp.canvas, -sp.size / 2, -sp.size / 2, sp.size, sp.size);
+    ctx.restore();
+  }
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+  }
+  ctx.globalAlpha = 1;
+
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${flash * 0.35})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // HUD: progress bar, attempt, reality
+  const bw = Math.min(400, W * 0.5), bx = W / 2 - bw / 2;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(bx, 16, bw, 14);
+  ctx.fillStyle = level.color;
+  ctx.fillRect(bx, 16, bw * progress(), 14);
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx, 16, bw, 14);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px system-ui';
+  ctx.fillText(`${Math.floor(progress() * 100)}%`, W / 2, 50);
+
+  if (boss) {
+    const hw = Math.min(320, W * 0.4), hx = W / 2 - hw / 2;
+    ctx.font = 'bold 15px system-ui';
+    ctx.fillStyle = level.color;
+    ctx.fillText(boss.name, W / 2, 76);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(hx, 84, hw, 10);
+    ctx.fillStyle = '#ff3b3b';
+    ctx.fillRect(hx, 84, hw * Math.max(0, boss.hp) / boss.max, 10);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.strokeRect(hx, 84, hw, 10);
+  }
+
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 18px system-ui';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(testing ? `TESTING · ${level.name}` : level.name, 20, 30);
+  ctx.font = '15px system-ui';
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText(`Attempt ${attempts}`, 20, 52);
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 18px system-ui';
+  ctx.fillStyle = th.player;
+  ctx.fillText(`REALITY: ${th.name}`, W - 20, 30);
+
+  const q = quitRect();
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(q.x, q.y, q.w, q.h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(q.x, q.y, q.w, q.h);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px system-ui';
+  ctx.fillText(testing ? '✕ Editor (Esc)' : '✕ Quit (Esc)', q.x + q.w / 2, q.y + 21);
+
+  ctx.textAlign = 'center';
+  // The level's new mechanic, shown for the first few seconds of a run.
+  const intro = (cam - startCam) / SPEED;
+  if (!boss && startCam === 0 && intro < 3.5) {
+    ctx.globalAlpha = Math.min(1, (3.5 - intro) * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(W / 2 - 330, H * 0.14 - 26, 660, 40);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 17px system-ui';
+    ctx.fillText(level.tip, W / 2, H * 0.14);
+    ctx.globalAlpha = 1;
+  }
+  if (cpFlash > 0 && state === 'play') {
+    ctx.globalAlpha = Math.min(1, cpFlash * 2);
+    ctx.fillStyle = level.color;
+    ctx.font = 'bold 28px system-ui';
+    ctx.fillText('CHECKPOINT', W / 2, H * 0.42);
+    ctx.globalAlpha = 1;
+  }
+  if (state === 'win') {
+    const top = H * 0.18;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, top, W, 300);
+    drawWarden(W / 2, top + 80, 0.75, performance.now() / 1000 * 0.3, level.color, 0, 0, false, true, levelIdx, 3);
+    ctx.fillStyle = level.color;
+    ctx.font = 'bold 18px system-ui';
+    ctx.fillText(`${boss ? boss.name : level.name.toUpperCase()} — DEFEATED`, W / 2, top + 152);
+    ctx.font = 'bold 52px system-ui';
+    ctx.fillText('LEVEL COMPLETE!', W / 2, top + 212);
+    ctx.fillStyle = '#fff';
+    ctx.font = '19px system-ui';
+    ctx.fillText(`${attempts} attempt${attempts === 1 ? '' : 's'}  ·  Click to ${testing ? 'return to editor' : 'return to menu'}`, W / 2, top + 256);
+  }
+}
+
+// --- Input -------------------------------------------------------------------
+let jumpHeld = false;
+const JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'];
+const SHIFT_KEYS = ['ShiftLeft', 'ShiftRight', 'KeyS', 'ArrowDown'];
+
+const quitRect = () => ({ x: W - 140, y: 44, w: 120, h: 32 });
+
+function leaveLevel() {
+  jumpHeld = false;
+  if (testing) backToEditor(); else state = 'menu';
+}
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  if (state === 'menu') {
+    if (e.button !== 0) return;
+    const b = buttons.find(b => e.clientX >= b.x && e.clientX <= b.x + b.w && e.clientY >= b.y && e.clientY <= b.y + b.h);
+    if (b) b.onClick();
+    return;
+  }
+  if (state === 'edit') {
+    snapshot();
+    strokeChanged = false;
+    painting = e.button === 2 ? 'erase' : 'paint';
+    applyTool(e.clientX, e.clientY, painting === 'erase');
+    return;
+  }
+  const q = quitRect();
+  if (e.clientX >= q.x && e.clientX <= q.x + q.w && e.clientY >= q.y && e.clientY <= q.y + q.h) { leaveLevel(); return; }
+  if (state === 'win') { leaveLevel(); return; }
+  if (e.button === 2) shift(); else if (e.button === 0) pressJump();
+});
+canvas.addEventListener('mousemove', e => {
+  hover = { x: e.clientX, y: e.clientY };
+  if (state === 'edit' && painting) applyTool(e.clientX, e.clientY, painting === 'erase');
+});
+canvas.addEventListener('mouseleave', () => { hover = null; });
+addEventListener('mouseup', e => {
+  if (e.button === 0) jumpHeld = false;
+  if (painting) {
+    painting = null;
+    if (strokeChanged) commitEdit(); else history.pop();
+  }
+});
+canvas.addEventListener('wheel', e => {
+  if (state !== 'edit') return;
+  e.preventDefault();
+  editCam = Math.max(0, editCam + (Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY));
+}, { passive: false });
+
+addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (state === 'menu') {
+    const n = ['Digit1', 'Digit2', 'Digit3'].indexOf(e.code);
+    if (n >= 0) playLevel(n);
+    return;
+  }
+  if (state === 'edit') {
+    if (e.code === 'Escape') { state = 'menu'; setBar(false); return; }
+    const n = e.code.startsWith('Digit') ? +e.code.slice(5) - 1 : -1;
+    if (n >= 0 && n < TOOLS.length) { tool = TOOLS[n]; refreshBar(); }
+    if (e.code === 'KeyQ') { editReal = (editReal + 1) % 3; refreshBar(); }
+    if (e.code === 'KeyZ' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
+    if (e.code === 'KeyP') playtest('start');
+    if (e.code === 'KeyT') playtest('here');
+    if (e.code === 'KeyB') playtest('boss');
+    if (e.code.startsWith('Arrow')) e.preventDefault();
+    return;
+  }
+  if (e.code === 'Escape') { leaveLevel(); return; }
+  if (state === 'win') { if (['Space', 'Enter'].includes(e.code)) leaveLevel(); return; }
+  if (e.repeat) return;
+  if (JUMP_KEYS.includes(e.code)) { e.preventDefault(); pressJump(); }
+  if (SHIFT_KEYS.includes(e.code)) { e.preventDefault(); shift(); }
+});
+addEventListener('keyup', e => {
+  keys.delete(e.code);
+  if (JUMP_KEYS.includes(e.code)) jumpHeld = false;
+});
+addEventListener('blur', () => { jumpHeld = false; keys.clear(); });
+
+let last = performance.now();
+let acc = 0;
+function loop(now) {
+  // Fixed-step physics: identical jumps and collisions regardless of frame rate.
+  acc += Math.min(0.1, (now - last) / 1000);
+  last = now;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  if (state === 'menu') drawMenu(now / 1000);
+  else if (state === 'edit') drawEditor();
+  else drawGame(acc / STEP);
+  requestAnimationFrame(loop);
+}
+addEventListener('resize', resize);
+resize();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
