@@ -360,6 +360,7 @@ function restart() {
   pauseTimer = 0;
   warp = null;
   flash = 0;
+  cpFlash = 0;   // the banner is only for reaching a checkpoint, not respawning at one
   const g = cp ? cp.g : 1;
   player = { y: g === 1 ? GROUND - SIZE : CEIL(), vy: 0, rot: 0, grounded: true, g };
   pressBuffer = 0;
