@@ -251,7 +251,9 @@ const DEFAULT_LEVELS = [
     l.rift(3, 3); l.spike(7); l.wallHere(S); l.spike(6); l.gap(5);   // a wall inside a rift pit: Blue
     l.rift(2, 2); l.spike(3); l.block(10, 4); l.spike(6); l.gap(5);  // a pillar too tall to jump
     l.roofOn(); l.gate(); l.gap(7);                       // up
-    l.rift(3, 4, S); l.rift(13, 4); l.hspike(24); l.gap(5);  // upside-down chain: Red
+    // Under a roof there's less room than above the ground (the floor is overhead), so
+    // these rifts sit 2 rows below the roof; upside-down rift launches are also capped.
+    l.rift(3, 5, S); l.rift(13, 5); l.hspike(24); l.gap(5);  // upside-down chain: Red
     l.gate(); l.roofOff(); l.gap(7);                      // down
     l.rift(3, 3, L); l.rift(13, 3, S); l.rift(23, 3, L); l.spike(34); l.gap(4);  // Blue
     l.wall(L); l.gap(3); l.rift(3, 3, L); l.spike(13); l.gap(5);   // Red, then shift back mid-air: Blue
@@ -435,7 +437,13 @@ function riftHits(cx, cy) {
 }
 
 function useRift(cx, cy) {
-  player.vy = JUMP_V * RIFT_LAUNCH * player.g;
+  let v = -JUMP_V * RIFT_LAUNCH;
+  // Upside down, the floor is overhead: cap the launch so it can never slam you into it.
+  if (player.g === -1) {
+    const room = GROUND - (player.y + SIZE) - 6;
+    v = Math.min(v, Math.sqrt(2 * GRAVITY * RIFT_FLOAT * Math.max(0, room)));
+  }
+  player.vy = -v * player.g;
   player.float = true;
   player.grounded = false;
   pressBuffer = 0;
@@ -862,15 +870,21 @@ function update(dt) {
       if (!o.used && pressBuffer > 0 && riftHits(cx, cy)) { o.used = true; useRift(cx, cy); }
       continue;
     }
-    if (!hits(o)) continue;
-    if (o.t === 'block' && g === 1 && prevBottom <= o.y + 10 && player.vy >= 0) {
-      player.y = o.y - SIZE; player.vy = 0; player.grounded = true;
-    } else if (o.t === 'block' && g === -1 && prevTop >= o.y + o.h - 10 && player.vy <= 0) {
-      player.y = o.y + o.h; player.vy = 0; player.grounded = true;
-    } else {
-      die();
-      return;
+    // Landing uses the cube's real edges (not the trimmed hit box), so you're grounded on
+    // a platform every step and a single tap jumps off it.
+    if (o.t === 'block' && PLAYER_X + SIZE - 4 > o.x && PLAYER_X + 4 < o.x + o.w) {
+      if (g === 1 && player.vy >= 0 && prevBottom <= o.y + 10 && player.y + SIZE >= o.y) {
+        player.y = o.y - SIZE; player.vy = 0; player.grounded = true;
+        continue;
+      }
+      if (g === -1 && player.vy <= 0 && prevTop >= o.y + o.h - 10 && player.y <= o.y + o.h) {
+        player.y = o.y + o.h; player.vy = 0; player.grounded = true;
+        continue;
+      }
     }
+    if (!hits(o)) continue;
+    die();
+    return;
   }
 
   if (player.grounded) player.float = false;
