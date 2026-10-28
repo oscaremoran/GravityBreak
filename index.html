@@ -498,7 +498,7 @@ function burst(x, y, color, n) {
 // core along the floor, and running into the core (in its reality) damages it.
 // Every hit starts a new phase with new attacks. Three hits break it.
 const BOSS_HP = 3;
-const BOSS_GAP = [0.75, 0.72, 0.6];   // base seconds between attacks, per level
+const BOSS_GAP = [0.75, 0.72, 0.52];   // base seconds between attacks, per level
 // Attacks per wave (one core drops after each wave), per level and phase: Horizon's
 // Warden drops cores less often than Shift's, and Break's only rarely.
 const WAVE_LEN = [[3, 4, 5], [5, 6, 7], [8, 9, 10]];
@@ -507,19 +507,25 @@ const BOSS_PHASES = [
   [['beam', 'lowR', 'high', 'lowR'], ['beam', 'split', 'twin', 'lowR', 'high'], ['split', 'twin', 'pulse', 'lowR', 'beam']],
   // Horizon: gravity gates and wave shots, then slams, then rapid flip-flops.
   [['gate', 'low', 'high', 'wave'], ['gate', 'slam', 'wave', 'low'], ['slam', 'flipflop', 'wave', 'high', 'gate']],
-  // Break: rift carpets and needles from the start, then double-rift carpets in mixed realities.
-  [['carpet', 'needle', 'lowR', 'carpet'], ['carpet2', 'needle', 'carpet', 'lowR'], ['carpet2', 'needle', 'carpet2', 'lowR', 'needle']],
+  // Break: fast shots; rift walls (a gap only a rift launch reaches), double needles,
+  // and double-rift carpets, with rifts in either reality from phase II.
+  [['carpet', 'riftwall', 'needle', 'lowR'], ['carpet2', 'needle2', 'riftwall', 'carpet', 'beam'], ['carpet2', 'riftwall', 'needle2', 'carpet2', 'beam', 'riftwall']],
 ];
 const PHASE_NAMES = ['', 'PHASE II', 'FINAL PHASE'];
-const SHOT_SPEED = 620;
+// Shots fly at the same speed for Shift and Horizon; Break's Warden fires ~25% faster.
+// Carpet lengths and rift positions scale with it (spd()) so the same moves still work.
+const SHOT_SPEEDS = [620, 620, 780];
+const shotSpeed = () => SHOT_SPEEDS[levelIdx];
+const spd = px => px * shotSpeed() / 620;
 const SHOT_R = 15;
 const CARPET_W = 560, CARPET2_W = 1050;
 const WAVE_SPEED = 2.6;               // how fast wave shots bob up and down (rad/s)
 const SPLIT_H = 90;                   // where a split wall changes reality, in px from the floor
 const NEEDLE_LO = 70, NEEDLE_HI = 200; // the gap in a needle wall, in px from the floor
+const RIFTWALL_LO = 190, RIFTWALL_HI = 330; // a rift wall's gap: too high for a normal jump
 // Minimum seconds after each attack before the next one, so every pattern is fair.
-const AFTER = { split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.8, carpet2: 2.6 };
-const JUMPED = ['low', 'lowR', 'wave', 'needle', 'carpet', 'carpet2', 'slam', 'split'];
+const AFTER = { riftwall: 1.4, needle2: 1.6, split: 0.95, twin: 1.0, pulse: 0.9, gate: 1.0, slam: 1.5, flipflop: 2.0, wave: 0.8, needle: 0.95, carpet: 1.8, carpet2: 2.6 };
+const JUMPED = ['low', 'lowR', 'wave', 'needle', 'needle2', 'riftwall', 'carpet', 'carpet2', 'slam', 'split'];
 // y for something `off` pixels from the floor the player will be standing on.
 const floorY = (g, off) => (g === 1 ? GROUND - off : TOP() + off);
 // Gravity attacks bring their own roof (there's no ceiling): a gate flips you up under
@@ -541,8 +547,8 @@ const bossPhase = () => Math.min(2, boss.max - boss.hp);
 function waitFor(prev, k, gap) {
   let wait = Math.max(gap, AFTER[prev] || 0);
   // You can't be under something high while still in the air from jumping something.
-  if (JUMPED.includes(prev) && (k === 'high' || k === 'wave' || k === 'needle')) wait = Math.max(wait, 0.95);
-  if (['gate', 'slam', 'flipflop', 'carpet', 'carpet2'].includes(k)) wait = Math.max(wait, 1.0);
+  if (JUMPED.includes(prev) && ['high', 'wave', 'needle', 'needle2', 'riftwall'].includes(k)) wait = Math.max(wait, 0.95);
+  if (['gate', 'slam', 'flipflop', 'carpet', 'carpet2', 'riftwall', 'needle2'].includes(k)) wait = Math.max(wait, 1.0);
   return wait;
 }
 
@@ -563,7 +569,7 @@ function nextWave() {
   for (let n = 0; n <= count; n++) {
     let k = n === count ? 'orb' : kinds[Math.floor(Math.random() * kinds.length)];
     if (cover > 0 && k in ROOF_COVER) k = 'low';           // no new roof while under one
-    const r = k === 'lowR' || k === 'beam' || (k === 'carpet' && (phase === 2 || levelIdx === 2)) ? randReality() : B;
+    const r = k === 'lowR' || k === 'beam' || (k === 'carpet' && (phase >= 1 || levelIdx === 2)) ? randReality() : B;
     let wait = waitFor(prev, k, gap);
     if (cover === 0 && boss.queue.length && boss.queue[boss.queue.length - 1].endsRoof) wait = Math.max(wait, 1.4);   // time to fall back down
     const a = { k, wait, r: k === 'orb' ? B : r, g: cover > 0 ? -1 : 1 };   // cores exist in both realities
@@ -582,7 +588,7 @@ function fire(a) {
   const roof = minTime => {
     let t = minTime;
     for (let n = 0, sum = 0; n < a.cover; n++) { sum += boss.queue[n].wait; t = Math.max(t, sum); }
-    const w = SHOT_SPEED * (t + 0.7);
+    const w = shotSpeed() * (t + 0.7);
     add({ k: 'gate', x, r: B });
     add({ k: 'roof', x, w, r: B });
     add({ k: 'gate', x: x + w - 30, r: B });
@@ -597,21 +603,30 @@ function fire(a) {
   } else if (a.k === 'twin') {
     const r = randReality();
     add({ k: 'beam', x, r });
-    add({ k: 'beam', x: x + SHOT_SPEED * 0.42, r: 1 - r });
+    add({ k: 'beam', x: x + shotSpeed() * 0.42, r: 1 - r });
   } else if (a.k === 'pulse') add({ k: 'pulse', x, r: B });
   else if (a.k === 'wave') add({ k: 'ball', x, y: floorY(g, 85), r: B, wave: g, wt: Math.random() * 6 });
   else if (a.k === 'gate') roof(0.6);
   else if (a.k === 'slam') {
     roof(0.75);
-    add({ k: 'ball', x: x + SHOT_SPEED * 0.75, y: floorY(-1, SHOT_R + 2), r: B });   // lands as you do
-  } else if (a.k === 'flipflop') roof(0.6); else if (a.k === 'needle') add({ k: 'needle', x, g, r: B });
-  else if (a.k === 'carpet') {
-    add({ k: 'carpet', x, w: CARPET_W, g, r: B });
-    add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: a.r });
+    add({ k: 'ball', x: x + shotSpeed() * 0.75, y: floorY(-1, SHOT_R + 2), r: B });   // lands as you do
+  } else if (a.k === 'flipflop') roof(0.6);
+  else if (a.k === 'needle') add({ k: 'needle', x, g, r: B, lo: NEEDLE_LO, hi: NEEDLE_HI });
+  else if (a.k === 'needle2') {
+    add({ k: 'needle', x, g, r: B, lo: NEEDLE_LO, hi: NEEDLE_HI });
+    add({ k: 'needle', x: x + shotSpeed() * 0.62, g, r: B, lo: NEEDLE_LO, hi: NEEDLE_HI });
+  } else if (a.k === 'riftwall') {
+    // Catch the rift, then float through a gap no normal jump can reach.
+    const rr = bossPhase() >= 1 ? randReality() : B;
+    add({ k: 'rift', x, y: floorY(g, 120), r: rr });
+    add({ k: 'needle', x: x + shotSpeed() * 0.39, g, r: B, lo: RIFTWALL_LO, hi: RIFTWALL_HI });
+  } else if (a.k === 'carpet') {
+    add({ k: 'carpet', x, w: spd(CARPET_W), g, r: B });
+    add({ k: 'rift', x: x + spd(170), y: floorY(g, 130), r: a.r });
   } else if (a.k === 'carpet2') {
-    add({ k: 'carpet', x, w: CARPET2_W, g, r: B });
-    add({ k: 'rift', x: x + 170, y: floorY(g, 130), r: B });
-    add({ k: 'rift', x: x + 650, y: floorY(g, 130), r: bossPhase() >= 1 ? randReality() : B });
+    add({ k: 'carpet', x, w: spd(CARPET2_W), g, r: B });
+    add({ k: 'rift', x: x + spd(170), y: floorY(g, 130), r: B });
+    add({ k: 'rift', x: x + spd(650), y: floorY(g, 130), r: bossPhase() >= 1 ? randReality() : B });
   }
 }
 
@@ -627,7 +642,7 @@ function shotHits(sh) {
   if (sh.k === 'needle') {
     if (!overlapX(12)) return false;
     const lo = sh.g === 1 ? GROUND - (py + ps) : py - TOP();    // player's distance from the floor
-    return lo < NEEDLE_LO || lo + ps > NEEDLE_HI;
+    return lo < sh.lo || lo + ps > sh.hi;
   }
   if (sh.k === 'carpet') {
     const top = sh.g === 1 ? GROUND - 26 : TOP();
@@ -680,7 +695,7 @@ function updateBoss(dt) {
   }
   for (const sh of shots) {
     sh.px = sh.x;
-    sh.x -= SHOT_SPEED * dt;
+    sh.x -= shotSpeed() * dt;
     if (sh.wave) { sh.wt += dt; sh.y = floorY(sh.wave, 85 + 65 * Math.sin(sh.wt * WAVE_SPEED)); }
   }
   shots = shots.filter(sh => sh.x + (sh.w || 0) > -60 && !sh.gone);
@@ -1383,7 +1398,7 @@ function drawBoss(alpha) {
       ctx.restore();
     } else if (sh.k === 'needle') {
       // A wall with a gap you have to jump through.
-      const a = floorY(sh.g, NEEDLE_LO), b = floorY(sh.g, NEEDLE_HI);
+      const a = floorY(sh.g, sh.lo), b = floorY(sh.g, sh.hi);
       const floor = sh.g === 1 ? GROUND : TOP(), far = sh.g === 1 ? CEIL() : GROUND;
       ctx.save();
       ctx.fillStyle = REAL_COLORS[B];
